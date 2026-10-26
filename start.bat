@@ -11,7 +11,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -c "import customtkinter, PIL" >nul 2>&1
+python -c "import PySide6, PIL" >nul 2>&1
 if errorlevel 1 (
     echo Installing required packages...
     python -m pip install -r requirements.txt

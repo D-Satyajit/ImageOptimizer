@@ -1,1417 +1,1193 @@
-import customtkinter as ctk
-from PIL import Image, ImageOps, ImageFilter
-from PIL.ExifTags import TAGS
-import os
-import hashlib
-import html
-import json
-import queue
-import tkinter as tk
-from tkinter import filedialog, ttk
-import threading
-import math
+"""Image Optimizer Pro - batch image optimizer and bulk file renamer (PySide6 / Qt UI)."""
 import logging
-from datetime import datetime
-import re
+import os
+import sys
 
 # Configure error logging (next to the script, regardless of working directory)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 logging.basicConfig(
-    filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'image_optimizer.log'),
+    filename=os.path.join(APP_DIR, 'image_optimizer.log'),
     level=logging.ERROR,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# Set appearance with dark mode styling
-ctk.set_appearance_mode("Dark")
-ctk.set_default_color_theme("blue")
+from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QObject, QRunnable, QSettings, Qt,
+                            QThread, QThreadPool, QTimer, QUrl, Signal)
+from PySide6.QtGui import (QColor, QDesktopServices, QIcon, QImage, QIntValidator, QKeySequence,
+                           QPalette, QPixmap, QShortcut)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
+                               QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+                               QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+                               QRadioButton, QScrollArea, QSizePolicy, QSlider, QSplitter,
+                               QStackedWidget, QTableView, QVBoxLayout, QWidget)
 
-class ImageOptimizerApp(ctk.CTk):
+import optimizer_core as core
+
+ASSETS_DIR = os.path.join(APP_DIR, "assets")
+PREVIEW_SIZE = 1200  # Longest side decoded for the preview
+PREVIEW_CACHE_SIZE = 30
+
+# File list columns: (metadata key, header)
+COLUMNS = (
+    ("filename", "Filename"),
+    ("new_name", "New Name"),
+    ("author", "Author"),
+    ("size", "File Size"),
+    ("file_type", "File Type"),
+    ("extension", "Extension"),
+    ("date", "Date"),
+    ("date_taken", "Date Taken"),
+    ("dimensions", "Dimensions"),
+    ("resolution", "Resolution"),
+    ("camera", "Camera Model"),
+)
+NEW_NAME_COLUMN = 1
+COLUMN_WIDTHS = {"filename": 220, "new_name": 220, "date": 130, "date_taken": 140, "camera": 140}
+
+RENAME_HINTS = {
+    "Sequential Numbering": "image_1, image_2, image_3 …",
+    "Alphanumeric Pattern": "img_A1 … img_A10, img_B1 …",
+    "Add Prefix/Suffix": "prefix + original name + suffix",
+    "Date and Time": "FILE_<date>_<time>_1, FILE_<date>_<time>_2 …",
+    "Custom Pattern": "prefix_1_suffix. Prefix and suffix may use {name}, {date} and {time}.",
+}
+
+# ========== THEME ==========
+COLORS = {
+    "bg": "#1e1f22",
+    "panel": "#2b2d31",
+    "border": "#3a3d44",
+    "text": "#e6e6e6",
+    "muted": "#9aa0a6",
+    "disabled": "#6b7078",
+    "accent": "#FFCC00",
+    "accent_hover": "#FFDD55",
+    "accent_dim": "#4a4120",
+    "blue": "#1E90FF",
+    "blue_hover": "#4169E1",
+    "green": "#5cb85c",
+    "green_hover": "#6cc66c",
+    "red": "#c9302c",
+}
+
+STYLESHEET = """
+QWidget { color: %(text)s; font-family: "Segoe UI"; font-size: 10pt; }
+QMainWindow, #MainArea { background: %(bg)s; }
+#Sidebar { background: %(panel)s; border-right: 1px solid %(border)s; }
+#SidebarViewport, #SettingsPage { background: transparent; }
+#AppTitle { font-size: 15pt; font-weight: 600; color: #ffffff; }
+#Muted { color: %(muted)s; }
+#Hint { color: %(muted)s; font-size: 9pt; }
+#SectionTitle { color: %(muted)s; font-size: 8pt; font-weight: 700; padding-top: 6px; }
+#Card { background: %(panel)s; border: 1px solid %(border)s; border-radius: 10px; }
+#CardTitle { font-size: 11pt; font-weight: 600; }
+#DropHint { color: %(muted)s; border: 2px dashed %(border)s; border-radius: 10px; font-size: 12pt; }
+#PreviewImage { color: %(muted)s; }
+
+QPushButton { background: %(border)s; border: 1px solid #4a4e57; border-radius: 6px; padding: 7px 12px; }
+QPushButton:hover { background: #454953; }
+QPushButton:pressed { background: #33363c; }
+QPushButton:disabled { color: %(disabled)s; background: #2f3237; border-color: #383b41; }
+QPushButton#Primary { background: %(accent)s; color: %(bg)s; border: none; font-weight: 600; }
+QPushButton#Primary:hover { background: %(accent_hover)s; }
+QPushButton#Rename { background: %(green)s; color: white; border: none; font-weight: 600; }
+QPushButton#Rename:hover { background: %(green_hover)s; }
+QPushButton#Browse { background: %(blue)s; color: white; border: none; font-weight: 600; }
+QPushButton#Browse:hover { background: %(blue_hover)s; }
+QPushButton#Browse:disabled, QPushButton#Rename:disabled, QPushButton#Primary:disabled {
+    background: #2f3237; color: %(disabled)s; }
+QPushButton#Danger { background: transparent; border: 1px solid %(red)s; color: #ff7b76; }
+QPushButton#Danger:hover { background: %(red)s; color: white; }
+QPushButton#Small { padding: 4px 10px; font-size: 9pt; }
+
+#SegmentBar { background: %(bg)s; border-radius: 8px; }
+QPushButton#Segment { background: transparent; border: none; border-radius: 6px; padding: 7px 10px; color: #b8bcc3; }
+QPushButton#Segment:hover { color: #ffffff; }
+QPushButton#Segment:checked { background: %(accent)s; color: %(bg)s; font-weight: 600; }
+
+QLineEdit, QComboBox { background: %(bg)s; border: 1px solid %(border)s; border-radius: 6px; padding: 5px 8px; }
+QLineEdit:focus, QComboBox:focus, QComboBox:on { border-color: %(accent)s; }
+QLineEdit:disabled, QComboBox:disabled { color: %(disabled)s; }
+QComboBox QAbstractItemView { background: %(panel)s; border: 1px solid %(border)s;
+    selection-background-color: %(accent_dim)s; outline: none; }
+
+QRadioButton, QCheckBox { spacing: 8px; padding: 2px 0; }
+QRadioButton:disabled, QCheckBox:disabled { color: %(disabled)s; }
+QRadioButton::indicator { width: 14px; height: 14px; border: 2px solid %(disabled)s; border-radius: 9px; background: %(bg)s; }
+QRadioButton::indicator:hover, QCheckBox::indicator:hover { border-color: %(accent_hover)s; }
+QRadioButton::indicator:checked { border-color: %(accent)s; background: qradialgradient(cx:0.5, cy:0.5, radius:0.5,
+    fx:0.5, fy:0.5, stop:0 %(accent)s, stop:0.55 %(accent)s, stop:0.65 %(bg)s, stop:1 %(bg)s); }
+QCheckBox::indicator { width: 14px; height: 14px; border: 2px solid %(disabled)s; border-radius: 4px; background: %(bg)s; }
+QCheckBox::indicator:checked { border-color: %(accent)s; background: %(accent)s; image: url(%(check_icon)s); }
+
+QSlider::groove:horizontal { height: 4px; background: %(border)s; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: %(accent)s; border-radius: 2px; }
+QSlider::handle:horizontal { background: %(accent)s; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }
+QSlider::sub-page:horizontal:disabled { background: %(accent_dim)s; }
+QSlider::handle:horizontal:disabled { background: %(disabled)s; }
+
+QTableView { background: #232428; alternate-background-color: #27292d; border: none;
+    selection-background-color: %(accent_dim)s; selection-color: #ffffff; outline: none; }
+QHeaderView::section { background: %(panel)s; color: #c8ccd2; border: none; border-right: 1px solid %(border)s;
+    border-bottom: 1px solid %(border)s; padding: 6px 8px; font-weight: 600; }
+QTableCornerButton::section { background: %(panel)s; border: none; }
+
+QProgressBar { background: %(bg)s; border: 1px solid %(border)s; border-radius: 5px; }
+QProgressBar::chunk { border-radius: 4px; background: #FFA500; }
+QProgressBar[state="processing"]::chunk { background: #FF4B4B; }
+QProgressBar[state="done"]::chunk { background: #3fb950; }
+
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #4a4e57; border-radius: 4px; min-height: 30px; margin: 1px; }
+QScrollBar::handle:horizontal { background: #4a4e57; border-radius: 4px; min-width: 30px; margin: 1px; }
+QScrollBar::handle:hover { background: #5c616b; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+QStatusBar { background: %(panel)s; border-top: 1px solid %(border)s; }
+QStatusBar::item { border: none; }
+QSplitter::handle { background: %(bg)s; }
+QScrollArea { border: none; background: transparent; }
+QToolTip { background: %(panel)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px; }
+"""
+
+
+def build_stylesheet():
+    """Fill theme colors and asset paths into the stylesheet"""
+    values = dict(COLORS, check_icon=os.path.join(ASSETS_DIR, "check.svg").replace("\\", "/"))
+    return STYLESHEET % values
+
+
+def dark_palette():
+    """Palette for parts Qt draws itself (scrollbars, menus, dialogs)"""
+    palette = QPalette()
+    role = QPalette.ColorRole
+    for color_role, color in (
+        (role.Window, COLORS["bg"]), (role.WindowText, COLORS["text"]),
+        (role.Base, COLORS["bg"]), (role.AlternateBase, "#27292d"),
+        (role.Text, COLORS["text"]), (role.Button, COLORS["border"]),
+        (role.ButtonText, COLORS["text"]), (role.ToolTipBase, COLORS["panel"]),
+        (role.ToolTipText, COLORS["text"]), (role.Highlight, COLORS["accent"]),
+        (role.HighlightedText, COLORS["bg"]), (role.PlaceholderText, COLORS["disabled"]),
+        (role.Link, COLORS["blue"]),
+    ):
+        palette.setColor(color_role, QColor(color))
+    for color_role in (role.Text, role.ButtonText, role.WindowText):
+        palette.setColor(QPalette.ColorGroup.Disabled, color_role, QColor(COLORS["disabled"]))
+    return palette
+
+
+def section_label(text):
+    label = QLabel(text.upper())
+    label.setObjectName("SectionTitle")
+    return label
+
+
+def hint_label(text=""):
+    label = QLabel(text)
+    label.setObjectName("Hint")
+    label.setWordWrap(True)
+    return label
+
+
+def make_card(title):
+    """Rounded panel with a title row; returns (card, header layout, body layout)"""
+    card = QFrame()
+    card.setObjectName("Card")
+    body = QVBoxLayout(card)
+    body.setContentsMargins(14, 12, 14, 14)
+    body.setSpacing(10)
+    header = QHBoxLayout()
+    title_label = QLabel(title)
+    title_label.setObjectName("CardTitle")
+    header.addWidget(title_label)
+    header.addStretch()
+    body.addLayout(header)
+    return card, header, body
+
+
+def repolish(widget):
+    """Re-apply the stylesheet after an objectName or property change"""
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
+# ========== BACKGROUND JOBS ==========
+class MetadataSignals(QObject):
+    loaded = Signal(int, list)  # load generation, [(path, metadata), ...]
+    finished = Signal(int)
+
+
+class MetadataLoader(QRunnable):
+    """Reads file metadata off the UI thread, reporting rows in small chunks"""
+
+    def __init__(self, generation, paths):
+        super().__init__()
+        self.setAutoDelete(False)
+        self.generation = generation
+        self.paths = paths
+        self.signals = MetadataSignals()
+
+    def run(self):
+        chunk = []
+        for path in self.paths:
+            chunk.append((path, core.extract_metadata(path)))
+            if len(chunk) == 25:
+                self.signals.loaded.emit(self.generation, chunk)
+                chunk = []
+        if chunk:
+            self.signals.loaded.emit(self.generation, chunk)
+        self.signals.finished.emit(self.generation)
+
+
+class PreviewSignals(QObject):
+    ready = Signal(str, QImage)
+
+
+class PreviewLoader(QRunnable):
+    """Decodes a downscaled preview off the UI thread"""
+
+    def __init__(self, path):
+        super().__init__()
+        self.setAutoDelete(False)
+        self.path = path
+        self.signals = PreviewSignals()
+
+    def run(self):
+        try:
+            img = core.load_preview(self.path, PREVIEW_SIZE)
+            data = img.tobytes("raw", "RGBA")
+            image = QImage(data, img.width, img.height, img.width * 4, QImage.Format.Format_RGBA8888).copy()
+        except Exception as e:
+            logging.error(f"Error loading preview for {self.path}: {str(e)}")
+            image = QImage()
+        self.signals.ready.emit(self.path, image)
+
+
+class OptimizeWorker(QThread):
+    """Runs one optimization batch on its own thread"""
+    progress = Signal(int, int, str)  # done, total, current filename
+    done = Signal(int, int, int, bool, str)  # total, files written, errors, cancelled, output dir
+
+    def __init__(self, settings):
+        super().__init__()
+        self.settings = settings
+        self.silent = False  # Set when the batch was reset; its result is not shown
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        total = len(self.settings["images"])
+        try:
+            report, errors, cancelled = core.BatchOptimizer(self.settings).run(
+                self.progress.emit, lambda: self._cancelled)
+            written = len(report)
+        except Exception:
+            logging.exception("Batch failed")
+            written, errors, cancelled = 0, total, False
+        self.done.emit(total, written, errors, cancelled, self.settings["output_dir"])
+
+
+# ========== WIDGETS ==========
+class FileTableModel(QAbstractTableModel):
+    """File list with metadata; the New Name column previews renames"""
+
+    def __init__(self, new_name_func):
+        super().__init__()
+        self.paths = []
+        self.metadata = []
+        self.new_name_func = new_name_func
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.paths)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(COLUMNS)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        key = COLUMNS[index.column()][0]
+        if role == Qt.ItemDataRole.DisplayRole:
+            if key == "new_name":
+                return self.new_name_func(self.paths[index.row()], index.row())
+            return str(self.metadata[index.row()][key])
+        if role == Qt.ItemDataRole.ToolTipRole and key == "filename":
+            return self.paths[index.row()]
+        if role == Qt.ItemDataRole.ForegroundRole and key == "new_name":
+            return QColor(COLORS["accent"])
+        return None
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return COLUMNS[section][1]
+        return None
+
+    def add_rows(self, rows):
+        if not rows:
+            return
+        first = len(self.paths)
+        self.beginInsertRows(QModelIndex(), first, first + len(rows) - 1)
+        for path, meta in rows:
+            self.paths.append(path)
+            self.metadata.append(meta)
+        self.endInsertRows()
+
+    def remove_rows(self, rows):
+        for row in sorted(rows, reverse=True):
+            self.beginRemoveRows(QModelIndex(), row, row)
+            del self.paths[row]
+            del self.metadata[row]
+            self.endRemoveRows()
+
+    def clear(self):
+        # Removing rows (rather than resetting the model) keeps column widths and hidden columns
+        if self.paths:
+            self.beginRemoveRows(QModelIndex(), 0, len(self.paths) - 1)
+            self.paths = []
+            self.metadata = []
+            self.endRemoveRows()
+
+    def refresh_new_names(self):
+        if self.paths:
+            self.dataChanged.emit(self.index(0, NEW_NAME_COLUMN), self.index(len(self.paths) - 1, NEW_NAME_COLUMN))
+
+
+class PreviewLabel(QLabel):
+    """Shows an image scaled to fit, rescaling as the panel resizes"""
+
     def __init__(self):
         super().__init__()
-        self.title("Image Optimizer Pro")
-        self.geometry("1200x800")
-        self.minsize(1000, 700)
-        
-        # Configure grid layout - 1 column for sidebar, 1 for main content
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-        
-        # Create sidebar with dark mode styling
-        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0, fg_color="#2b2b2b")
-        self.sidebar.grid(row=0, column=0, sticky="nsew")
-        
-        # Configure sidebar rows - all content aligned to top
-        for i in range(25):
-            self.sidebar.grid_rowconfigure(i, weight=0)
-        self.sidebar.grid_rowconfigure(24, weight=1)  # Push buttons to bottom
-        
-        # Create main content area
-        self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="#333333")
-        self.main_frame.grid(row=0, column=1, sticky="nsew")
-        self.main_frame.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_rowconfigure(0, weight=3)  # Preview area
-        self.main_frame.grid_rowconfigure(1, weight=7)  # File list area
-        self.main_frame.grid_rowconfigure(2, weight=0)  # Status bar area
-        
-        # Initialize variables
-        self.images = []
-        self.image_metadata = []
-        self.current_image_index = 0
-        self.optimized_images = []
-        self.output_dir = ""
-        self.processing_thread = None
-        self.processing = False
-        self.ui_queue = queue.Queue()  # Status updates from the worker thread
-        self.settings = {}  # Settings snapshot for the current batch
-        self.source_paths = set()
-        self.batch_outputs = set()
+        self.setObjectName("PreviewImage")
+        self._pixmap = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(200, 120)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
 
-        # Set up UI components
-        self.setup_sidebar()
-        self.setup_main_area()
-        self.setup_status_bar()
-        
-        # Initialize in optimization mode
-        self.toggle_mode("optimize")
-        
-    def setup_sidebar(self):
-        """Configure sidebar controls with yellow styling for interactive elements"""
-        yellow_style = {"fg_color": "#FFCC00", "hover_color": "#FFDD55"}
-        
+    def set_image(self, pixmap):
+        self._pixmap = pixmap
+        self.setText("")
+        self._rescale()
+
+    def set_message(self, text):
+        self._pixmap = None
+        self.setPixmap(QPixmap())
+        self.setText(text)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self):
+        if self._pixmap is None or self._pixmap.isNull():
+            return
+        dpr = self.devicePixelRatioF()
+        scaled = self._pixmap.scaled(self.size() * dpr, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation)
+        # Never enlarge beyond the decoded preview
+        if scaled.width() > self._pixmap.width():
+            scaled = QPixmap(self._pixmap)
+        scaled.setDevicePixelRatio(dpr)
+        self.setPixmap(scaled)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Image Optimizer Pro")
+        self.resize(1200, 800)
+        self.setMinimumSize(1000, 700)
+        self.setAcceptDrops(True)
+        icon_path = os.path.join(ASSETS_DIR, "icon.svg")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
+        # Remembers the last folders used, in an INI file next to the script
+        self.settings_store = QSettings(os.path.join(APP_DIR, "image_optimizer.ini"), QSettings.Format.IniFormat)
+        self.pool = QThreadPool.globalInstance()
+        self.jobs = {}  # signals object -> running QRunnable (keeps both alive)
+        self.load_generation = 0  # Bumped on clear/reset so late metadata results are ignored
+        self.pending_keys = set()  # Files whose metadata is still loading
+        self.load_done_status = "Ready"
+        self.preview_cache = {}  # path -> QImage, oldest first
+        self.preview_path = None
+        self.worker = None
+        self.last_output_dir = ""
+        self.mode = "optimize"
+
+        self.model = FileTableModel(self.preview_new_name)
+
+        central = QWidget()
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.build_sidebar())
+        root.addWidget(self.build_main_area(), 1)
+        self.setCentralWidget(central)
+        self.build_status_bar()
+
+        # Short delay so scrolling through the list doesn't decode every image on the way
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(60)
+        self.preview_timer.timeout.connect(self.load_current_preview)
+
+        open_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Open), self)
+        open_shortcut.activated.connect(self.browse_files)
+        delete_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self.table)
+        delete_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        delete_shortcut.activated.connect(self.remove_selected)
+
+        self.reset_settings()
+        self.set_mode("optimize")
+
+    # ========== LAYOUT ==========
+    def build_sidebar(self):
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(300)
+        outer = QVBoxLayout(sidebar)
+        outer.setContentsMargins(18, 18, 18, 18)
+        outer.setSpacing(10)
+
+        title = QLabel("Image Optimizer Pro")
+        title.setObjectName("AppTitle")
+        subtitle = QLabel("Optimize and rename images in bulk")
+        subtitle.setObjectName("Muted")
+        outer.addWidget(title)
+        outer.addWidget(subtitle)
+        outer.addSpacing(4)
+
         # ========== MODE SELECTION ==========
-        # Mode selection: File Renaming or Image Optimizing
-        mode_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        mode_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
-        
-        self.mode_var = ctk.StringVar(value="optimize")  # Default to image optimizing
-        optimize_rb = ctk.CTkRadioButton(
-            mode_frame, 
-            text="Image Optimize", 
-            variable=self.mode_var, 
-            value="optimize",
-            command=lambda: self.toggle_mode("optimize")
-        )
-        optimize_rb.pack(side="left", padx=(0, 10))
-        
-        rename_rb = ctk.CTkRadioButton(
-            mode_frame, 
-            text="File Rename", 
-            variable=self.mode_var, 
-            value="rename",
-            command=lambda: self.toggle_mode("rename")
-        )
-        rename_rb.pack(side="left")
-        
-        # ========== IMAGE OPTIMIZATION CONTROLS ==========
-        self.optimize_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.optimize_frame.grid(row=1, column=0, sticky="ew", padx=0, pady=0)
-        
-        # Format settings
-        format_label = ctk.CTkLabel(self.optimize_frame, text="Output Format:", anchor="w")
-        format_label.grid(row=0, column=0, padx=20, pady=(20, 0), sticky="w")
-        
-        self.format_var = ctk.StringVar(value="webp")
-        formats = ["JPEG", "PNG", "WebP", "AVIF"]
-        for i, fmt in enumerate(formats):
-            rb = ctk.CTkRadioButton(
-                self.optimize_frame, 
-                text=fmt, 
-                variable=self.format_var, 
-                value=fmt.lower(),
-                font=("Arial", 10),
-                **yellow_style  # Apply yellow styling
-            )
-            rb.grid(row=i+1, column=0, padx=20, pady=(0, 2), sticky="w")
-        
-        # Compression settings - default to lossy at quality 80
-        comp_label = ctk.CTkLabel(self.optimize_frame, text="Compression:", anchor="w")
-        comp_label.grid(row=5, column=0, padx=20, pady=(10, 0), sticky="w")
-        
-        self.comp_mode = ctk.StringVar(value="lossy")  # Set default to lossy
-        lossless_rb = ctk.CTkRadioButton(
-            self.optimize_frame, 
-            text="Lossless", 
-            variable=self.comp_mode, 
-            value="lossless",
-            font=("Arial", 10),
-            command=self.on_comp_mode_change,
-            **yellow_style
-        )
-        lossless_rb.grid(row=6, column=0, padx=20, pady=(0, 2), sticky="w")
+        segment_bar = QFrame()
+        segment_bar.setObjectName("SegmentBar")
+        segment_layout = QHBoxLayout(segment_bar)
+        segment_layout.setContentsMargins(3, 3, 3, 3)
+        segment_layout.setSpacing(3)
+        self.optimize_mode_btn = QPushButton("Image Optimize")
+        self.rename_mode_btn = QPushButton("File Rename")
+        mode_group = QButtonGroup(self)
+        for button, mode in ((self.optimize_mode_btn, "optimize"), (self.rename_mode_btn, "rename")):
+            button.setObjectName("Segment")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda checked, m=mode: self.set_mode(m))
+            mode_group.addButton(button)
+            segment_layout.addWidget(button)
+        outer.addWidget(segment_bar)
 
-        lossy_rb = ctk.CTkRadioButton(
-            self.optimize_frame,
-            text="Lossy",
-            variable=self.comp_mode,
-            value="lossy",
-            font=("Arial", 10),
-            command=self.on_comp_mode_change,
-            **yellow_style
-        )
-        lossy_rb.grid(row=7, column=0, padx=20, pady=(0, 10), sticky="w")
-        
-        # Quality slider
-        self.quality_label = ctk.CTkLabel(self.optimize_frame, text="Quality: 80%")
-        self.quality_label.grid(row=8, column=0, padx=20, pady=(0, 0), sticky="w")
-        
-        self.quality_slider = ctk.CTkSlider(
-            self.optimize_frame, 
-            from_=10, 
-            to=100, 
-            number_of_steps=90,
-            command=self.update_quality_label
-        )
-        self.quality_slider.set(80)
-        self.quality_slider.grid(row=9, column=0, padx=20, pady=(5, 10), sticky="ew")
-        self.on_comp_mode_change()
+        # Settings for the current mode (scrolls on small screens); the hidden page takes no space
+        self.settings_panel = QWidget()
+        self.settings_panel.setObjectName("SettingsPage")
+        panel_layout = QVBoxLayout(self.settings_panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        self.optimize_page = self.build_optimize_page()
+        self.rename_page = self.build_rename_page()
+        panel_layout.addWidget(self.optimize_page)
+        panel_layout.addWidget(self.rename_page)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setObjectName("SidebarViewport")
+        scroll.setWidget(self.settings_panel)
+        outer.addWidget(scroll, 1)
+
+        # ========== ACTIONS ==========
+        self.browse_btn = QPushButton("Add Images…")
+        self.browse_btn.setObjectName("Browse")
+        self.browse_btn.setToolTip("Add files (Ctrl+O). You can also drag files or folders onto the window.")
+        self.browse_btn.clicked.connect(self.browse_files)
+
+        self.run_btn = QPushButton("Optimize Images")
+        self.run_btn.setObjectName("Primary")
+        self.run_btn.clicked.connect(self.run_action)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.cancel_processing)
+        self.cancel_btn.hide()
+
+        reset_btn = QPushButton("Clear All && Reset")
+        reset_btn.setObjectName("Danger")
+        reset_btn.clicked.connect(self.reset_application)
+
+        for button in (self.browse_btn, self.run_btn, self.cancel_btn, reset_btn):
+            button.setMinimumHeight(38)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            outer.addWidget(button)
+        return sidebar
+
+    def build_optimize_page(self):
+        page = QWidget()
+        page.setObjectName("SettingsPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 6, 0)
+        layout.setSpacing(6)
+
+        # Format settings
+        layout.addWidget(section_label("Output format"))
+        format_grid = QGridLayout()
+        format_grid.setHorizontalSpacing(12)
+        self.format_group = QButtonGroup(self)
+        self.format_buttons = {}
+        for i, fmt in enumerate(core.OUTPUT_FORMATS):
+            button = QRadioButton(fmt)
+            self.format_group.addButton(button)
+            self.format_buttons[fmt.lower()] = button
+            format_grid.addWidget(button, i // 2, i % 2)
+        layout.addLayout(format_grid)
+
+        # Compression settings
+        layout.addWidget(section_label("Compression"))
+        comp_row = QHBoxLayout()
+        self.lossy_rb = QRadioButton("Lossy")
+        self.lossless_rb = QRadioButton("Lossless")
+        comp_group = QButtonGroup(self)
+        for button in (self.lossy_rb, self.lossless_rb):
+            comp_group.addButton(button)
+            comp_row.addWidget(button)
+        comp_row.addStretch()
+        layout.addLayout(comp_row)
+        self.lossy_rb.toggled.connect(self.on_comp_mode_change)
+
+        quality_row = QHBoxLayout()
+        self.quality_title = QLabel("Quality")
+        self.quality_value = QLabel()
+        quality_row.addWidget(self.quality_title)
+        quality_row.addStretch()
+        quality_row.addWidget(self.quality_value)
+        layout.addLayout(quality_row)
+        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.quality_slider.setRange(10, 100)
+        self.quality_slider.valueChanged.connect(lambda value: self.quality_value.setText(f"{value}%"))
+        layout.addWidget(self.quality_slider)
+        self.comp_hint = hint_label()
+        layout.addWidget(self.comp_hint)
 
         # Responsive sizes
-        size_label = ctk.CTkLabel(self.optimize_frame, text="Responsive Sizes:", anchor="w")
-        size_label.grid(row=10, column=0, padx=20, pady=(5, 0), sticky="w")
-        
-        # Size presets - Added 2K and 4K resolutions
-        self.size_presets = ctk.CTkComboBox(
-            self.optimize_frame,
-            values=[
-                "Mobile (480px)", 
-                "Tablet (768px)", 
-                "Desktop (1080px)", 
-                "Full HD (1920px)",
-                "2K (2560px)",      # New 2K resolution
-                "4K (3840px)",      # New 4K resolution
-                "Custom..."
-            ],
-            command=self.on_size_preset_select
-        )
-        self.size_presets.set("Full HD (1920px)")
-        self.size_presets.grid(row=11, column=0, padx=20, pady=(5, 0), sticky="ew")
-        
-        # Custom size entry
-        custom_size_frame = ctk.CTkFrame(self.optimize_frame, fg_color="transparent")
-        custom_size_frame.grid(row=12, column=0, padx=20, pady=(5, 0), sticky="ew")
-        custom_size_frame.grid_columnconfigure(0, weight=1)
-        custom_size_frame.grid_columnconfigure(1, weight=0)
-        custom_size_frame.grid_columnconfigure(2, weight=1)
-        
-        # Width entry (disabled by default)
-        self.width_var = ctk.StringVar(value="1920")
-        self.width_entry = ctk.CTkEntry(custom_size_frame, placeholder_text="Width", 
-                                  textvariable=self.width_var, width=80, state="disabled")
-        self.width_entry.grid(row=0, column=0, padx=(0, 5), sticky="ew")
-        
-        ctk.CTkLabel(custom_size_frame, text="x").grid(row=0, column=1, padx=5)
-        
-        # Height entry (disabled, auto-calculated)
-        self.height_var = ctk.StringVar(value="")
-        self.height_entry = ctk.CTkEntry(custom_size_frame, placeholder_text="Height", 
-                                   textvariable=self.height_var, width=80, state="disabled")
-        self.height_entry.grid(row=0, column=2, padx=(5, 0), sticky="ew")
-        
+        layout.addWidget(section_label("Size"))
+        self.size_combo = QComboBox()
+        self.size_combo.addItems(list(core.SIZE_PRESETS))
+        self.size_combo.currentTextChanged.connect(self.on_size_preset_select)
+        layout.addWidget(self.size_combo)
+        width_row = QHBoxLayout()
+        width_row.addWidget(QLabel("Width"))
+        self.width_edit = QLineEdit()
+        self.width_edit.setValidator(QIntValidator(1, 50000, self))
+        self.width_edit.setPlaceholderText("Original size")
+        self.width_edit.textChanged.connect(self.update_output_size)
+        width_row.addWidget(self.width_edit, 1)
+        width_row.addWidget(QLabel("px"))
+        layout.addLayout(width_row)
+        self.output_size_label = hint_label()
+        self.output_size_label.setToolTip("Height follows each image's own shape. Smaller images are never enlarged.")
+        layout.addWidget(self.output_size_label)
+
         # Additional options
-        self.progressive_var = ctk.BooleanVar(value=True)
-        progressive_cb = ctk.CTkCheckBox(
-            self.optimize_frame, 
-            text="Progressive JPEG", 
-            variable=self.progressive_var,
-            font=("Arial", 10),
-            **yellow_style
-        )
-        progressive_cb.grid(row=13, column=0, padx=20, pady=(10, 0), sticky="w")
-        
-        self.lqip_var = ctk.BooleanVar(value=False)
-        lqip_cb = ctk.CTkCheckBox(
-            self.optimize_frame, 
-            text="Generate LQIP", 
-            variable=self.lqip_var,
-            font=("Arial", 10),
-            **yellow_style
-        )
-        lqip_cb.grid(row=14, column=0, padx=20, pady=(0, 2), sticky="w")
-        
-        self.strip_meta_var = ctk.BooleanVar(value=False)
-        strip_cb = ctk.CTkCheckBox(
-            self.optimize_frame, 
-            text="Strip Metadata", 
-            variable=self.strip_meta_var,
-            font=("Arial", 10),
-            **yellow_style
-        )
-        strip_cb.grid(row=15, column=0, padx=20, pady=(0, 2), sticky="w")
-        
-        # Changed default to unchecked for hashed filenames
-        self.hash_names_var = ctk.BooleanVar(value=False)  # Default to unchecked
-        hash_cb = ctk.CTkCheckBox(
-            self.optimize_frame, 
-            text="Hashed Filenames", 
-            variable=self.hash_names_var,
-            font=("Arial", 10),
-            **yellow_style
-        )
-        hash_cb.grid(row=16, column=0, padx=20, pady=(0, 10), sticky="w")
-        
-        # ========== FILE RENAMING CONTROLS ==========
-        self.rename_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.rename_frame.grid(row=1, column=0, sticky="ew", padx=0, pady=0)
-        
-        # Renaming section title
-        rename_label = ctk.CTkLabel(self.rename_frame, text="Bulk Rename:", font=("Arial", 12, "bold"))
-        rename_label.grid(row=0, column=0, padx=20, pady=(5, 0), sticky="w")
-        
-        # Renaming format selection
-        self.rename_format_var = ctk.StringVar(value="Sequential Numbering")
-        rename_formats = [
-            "Sequential Numbering",
-            "Alphanumeric Pattern",
-            "Add Prefix/Suffix",
-            "Date and Time",
-            "Custom Pattern"
-        ]
-        
-        format_dropdown = ctk.CTkComboBox(
-            self.rename_frame,
-            values=rename_formats,
-            variable=self.rename_format_var,
-            command=self.update_rename_preview
-        )
-        format_dropdown.grid(row=1, column=0, padx=20, pady=(5, 0), sticky="ew")
-        
-        # Prefix input
-        prefix_frame = ctk.CTkFrame(self.rename_frame, fg_color="transparent")
-        prefix_frame.grid(row=2, column=0, padx=20, pady=(5, 0), sticky="ew")
-        ctk.CTkLabel(prefix_frame, text="Prefix:").pack(side="left", padx=(0, 5))
-        self.prefix_var = ctk.StringVar(value="")
-        self.prefix_var.trace_add("write", self.update_rename_preview)
-        prefix_entry = ctk.CTkEntry(prefix_frame, textvariable=self.prefix_var, width=100)
-        prefix_entry.pack(side="left", fill="x", expand=True)
-        
-        # Suffix input
-        suffix_frame = ctk.CTkFrame(self.rename_frame, fg_color="transparent")
-        suffix_frame.grid(row=3, column=0, padx=20, pady=(5, 0), sticky="ew")
-        ctk.CTkLabel(suffix_frame, text="Suffix:").pack(side="left", padx=(0, 5))
-        self.suffix_var = ctk.StringVar(value="")
-        self.suffix_var.trace_add("write", self.update_rename_preview)
-        suffix_entry = ctk.CTkEntry(suffix_frame, textvariable=self.suffix_var, width=100)
-        suffix_entry.pack(side="left", fill="x", expand=True)
-        
-        # Date/time options
-        date_time_frame = ctk.CTkFrame(self.rename_frame, fg_color="transparent")
-        date_time_frame.grid(row=4, column=0, padx=20, pady=(5, 0), sticky="ew")
-        
-        self.include_date_var = ctk.BooleanVar(value=True)
-        date_cb = ctk.CTkCheckBox(
-            date_time_frame, 
-            text="Date", 
-            variable=self.include_date_var,
-            command=self.update_rename_preview
-        )
-        date_cb.pack(side="left", padx=(0, 10))
-        
-        self.include_time_var = ctk.BooleanVar(value=True)
-        time_cb = ctk.CTkCheckBox(
-            date_time_frame, 
-            text="Time", 
-            variable=self.include_time_var,
-            command=self.update_rename_preview
-        )
-        time_cb.pack(side="left")
-        
-        # Rename preview button
-        preview_btn = ctk.CTkButton(
-            self.rename_frame,
-            text="Preview Rename",
-            command=self.update_rename_preview,
-            fg_color="#5bc0de"
-        )
-        preview_btn.grid(row=5, column=0, padx=20, pady=(10, 5), sticky="ew")
-        
-        # ========== COMMON CONTROLS ==========
-        # Browse Files button (blue color)
-        self.browse_btn = ctk.CTkButton(
-            self.sidebar, 
-            text="Browse Files", 
-            command=self.browse_files,
-            fg_color="#1E90FF",  # Dodger blue color
-            hover_color="#4169E1",  # Royal blue hover
-            font=("Arial", 12, "bold")
-        )
-        self.browse_btn.grid(row=17, column=0, padx=20, pady=(10, 10), sticky="ew")
-        
-        # Process button
-        self.process_btn = ctk.CTkButton(
-            self.sidebar, 
-            text="Optimize Images", 
-            command=self.start_processing
-        )
-        self.process_btn.grid(row=18, column=0, padx=20, pady=(0, 10), sticky="ew")
-        
-        # Apply rename button
-        self.rename_btn = ctk.CTkButton(
-            self.sidebar,
-            text="Apply Rename",
-            command=self.apply_rename,
-            fg_color="#5cb85c"
-        )
-        self.rename_btn.grid(row=18, column=0, padx=20, pady=(0, 10), sticky="ew")
-        
-        # Clear and reset button
-        reset_btn = ctk.CTkButton(
-            self.sidebar, 
-            text="Clear All & Reset", 
-            command=self.reset_application,
-            fg_color="#c9302c", 
-            hover_color="#d9534f" 
-        )
-        reset_btn.grid(row=19, column=0, padx=20, pady=(0, 20), sticky="ew")
-        
-        # Initially hide the rename button
-        self.rename_btn.grid_remove()
-        
-    def toggle_mode(self, mode):
-        """Enable/disable controls based on selected mode"""
-        if mode == "optimize":
-            # Show optimization controls and hide renaming controls
-            self.optimize_frame.grid()
-            self.rename_frame.grid_remove()
-            
-            # Update buttons
-            self.process_btn.grid()
-            self.rename_btn.grid_remove()
-            self.browse_btn.configure(text="Browse Images")
-            
-            # Disable renaming-specific features
-            self.file_frame.grid()  # Show file list
-            self.preview_frame.grid()  # Show preview
-            
-        else:  # "rename"
-            # Show renaming controls and hide optimization controls
-            self.rename_frame.grid()
-            self.optimize_frame.grid_remove()
-            
-            # Update buttons
-            self.process_btn.grid_remove()
-            self.rename_btn.grid()
-            self.browse_btn.configure(text="Browse Files")
-            
-            # Hide preview for non-image files
-            self.preview_frame.grid_remove()
-            
-        # Clear existing selection when switching modes
-        self.images = []
-        self.image_metadata = []
-        self.update_file_list()
-        self.update_status_bar("Ready")
-        
-    def browse_files(self):
-        """Open file dialog to browse for files"""
-        # Determine file types based on current mode
-        if self.mode_var.get() == "optimize":
-            # In optimization mode, only show image files including WEBP
-            filetypes = (
-                ("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff *.gif *.webp"),
-                ("All files", "*.*")
-            )
-        else:
-            # In renaming mode, show all file types
-            filetypes = (("All files", "*.*"),)
-        
-        # Open file dialog with appropriate file filters
-        files = filedialog.askopenfilenames(
-            title="Select Files" if self.mode_var.get() == "rename" else "Select Images",
-            filetypes=filetypes
-        )
-        
-        if files:
-            # Store files regardless of type in renaming mode
-            if self.mode_var.get() == "rename":
-                self.images = list(files)
-            else:
-                # Filter valid image files in optimization mode
-                valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.gif', '.webp')
-                self.images = [f for f in files if os.path.splitext(f)[1].lower() in valid_extensions]
-            
-            if not self.images:
-                self.update_status_bar("No valid files found")
-                return
-                
-            # Extract metadata - handles both image and non-image files
-            self.image_metadata = [self.extract_metadata(f) for f in self.images]
-            self.update_file_list()
-            self.current_image_index = 0
-            
-            # Only show image preview in optimization mode
-            if self.mode_var.get() == "optimize":
-                self.show_image()
-                self.show_work_area()
-                
-            self.update_status_bar()
-            self.update_rename_preview()
-        
-    # ========== FILE RENAMING MODULE ==========
-    def generate_new_filename(self, path, index):
-        """
-        Generate new filename based on selected renaming pattern
-        - path: Original file path
-        - index: Position in file list (for sequential numbering)
-        Returns new filename with extension
-        """
-        # Get file extension
-        base_name = os.path.basename(path)
-        name, ext = os.path.splitext(base_name)
-        ext = ext.lower()  # Standardize extension case
-        
-        # Get renaming pattern
-        pattern = self.rename_format_var.get()
-        
-        # Apply selected pattern
-        if pattern == "Sequential Numbering":
-            return f"image_{index+1}{ext}"
-        
-        elif pattern == "Alphanumeric Pattern":
-            # Generate pattern: img_A1 ... img_A10, img_B1 ... img_Z10, img_AA1, etc.
-            letter = ""
-            group = index // 10
-            while group >= 0:
-                letter = chr(65 + group % 26) + letter
-                group = group // 26 - 1
-            number = index % 10 + 1
-            return f"img_{letter}{number}{ext}"
-        
-        elif pattern == "Add Prefix/Suffix":
-            prefix = self.prefix_var.get()
-            suffix = self.suffix_var.get()
-            return f"{prefix}{name}{suffix}{ext}"
-        
-        elif pattern == "Date and Time":
-            now = datetime.now()
-            date_str = now.strftime("%Y-%m-%d") if self.include_date_var.get() else ""
-            time_str = now.strftime("%H-%M") if self.include_time_var.get() else ""
-            
-            # Combine date and time
-            dt_str = ""
-            if date_str and time_str:
-                dt_str = f"{date_str}_{time_str}"
-            elif date_str:
-                dt_str = date_str
-            elif time_str:
-                dt_str = time_str
-                
-            return f"FILE_{dt_str}_{index+1}{ext}"
-        
-        elif pattern == "Custom Pattern":
-            # Allow user-defined pattern with placeholders
-            custom_pattern = f"{self.prefix_var.get()}_{{index}}_{self.suffix_var.get()}"
-            
-            # Get date/time if needed
-            now = datetime.now()
-            date_str = now.strftime("%Y-%m-%d") if self.include_date_var.get() else ""
-            time_str = now.strftime("%H-%M") if self.include_time_var.get() else ""
-            
-            # Replace placeholders
-            custom_pattern = custom_pattern.replace("{prefix}", self.prefix_var.get())
-            custom_pattern = custom_pattern.replace("{suffix}", self.suffix_var.get())
-            custom_pattern = custom_pattern.replace("{index}", str(index+1))
-            custom_pattern = custom_pattern.replace("{date}", date_str)
-            custom_pattern = custom_pattern.replace("{time}", time_str)
-            custom_pattern = custom_pattern.replace("{name}", name)
-            
-            return f"{custom_pattern}{ext}"
-        
-        # Fallback to original name
-        return base_name
-    
-    def update_rename_preview(self, *args):
-        """Update the file list to show preview of new filenames"""
-        if not self.images or self.mode_var.get() != "rename":
-            return
-            
-        # Update treeview with new names
-        for i, item in enumerate(self.tree.get_children()):
-            # Get original metadata
-            values = list(self.tree.item(item, "values"))
-            
-            if len(values) > 0:
-                # Generate new filename
-                new_name = self.generate_new_filename(self.images[i], i)
-                
-                # Update the filename in metadata display
-                values[0] = new_name
-                self.tree.item(item, values=values)
-    
-    def apply_rename(self):
-        """Apply the selected renaming pattern to all loaded files"""
-        if not self.images:
-            self.update_status_bar("No files to rename")
-            return
-            
-        try:
-            renamed_count = 0
-            
-            # Create a copy of the current images list to avoid modification during iteration
-            original_paths = self.images.copy()
-            
-            for i, path in enumerate(original_paths):
-                # Generate new filename
-                new_name = self.generate_new_filename(path, i)
-                dir_path = os.path.dirname(path)
-                new_path = os.path.join(dir_path, new_name)
-                
-                # Skip if name hasn't changed
-                if os.path.basename(path) == new_name:
-                    continue
-                
-                # Handle filename conflicts (a case-only rename on Windows matches the file itself)
-                counter = 1
-                base_new_path = new_path
-                while (os.path.exists(new_path) and
-                       os.path.normcase(os.path.abspath(new_path)) != os.path.normcase(os.path.abspath(path))):
-                    name, ext = os.path.splitext(base_new_path)
-                    new_path = f"{name}_{counter}{ext}"
-                    counter += 1
-                
-                # Rename the file
-                os.rename(path, new_path)
-                renamed_count += 1
-                
-                # Update the file path in our list
-                self.images[i] = new_path
-            
-            # Update metadata and UI
-            self.image_metadata = [self.extract_metadata(f) for f in self.images]
-            self.update_file_list()
-            self.update_status_bar(f"Renamed {renamed_count} files successfully")
-            
-        except Exception as e:
-            logging.error(f"Error renaming files: {str(e)}")
-            self.update_status_bar(f"Error renaming files: {str(e)}")
-    
-    # ========== IMAGE OPTIMIZATION MODULE ==========
-    def on_size_preset_select(self, choice):
-        """Handle size preset selection and update width/height fields"""
-        if choice == "Mobile (480px)":
-            self.width_var.set("480")
-            self.width_entry.configure(state="disabled")
-            self.update_height_display()
-        elif choice == "Tablet (768px)":
-            self.width_var.set("768")
-            self.width_entry.configure(state="disabled")
-            self.update_height_display()
-        elif choice == "Desktop (1080px)":
-            self.width_var.set("1080")
-            self.width_entry.configure(state="disabled")
-            self.update_height_display()
-        elif choice == "Full HD (1920px)":
-            self.width_var.set("1920")
-            self.width_entry.configure(state="disabled")
-            self.update_height_display()
-        # Handle new 2K resolution
-        elif choice == "2K (2560px)":
-            self.width_var.set("2560")
-            self.width_entry.configure(state="disabled")
-            self.update_height_display()
-        # Handle new 4K resolution
-        elif choice == "4K (3840px)":
-            self.width_var.set("3840")
-            self.width_entry.configure(state="disabled")
-            self.update_height_display()
-        elif choice == "Custom...":
-            self.width_var.set("")
-            self.width_entry.configure(state="normal")
-            self.height_var.set("")
-        
-    def update_height_display(self):
-        """Calculate and display height based on current width and image aspect ratio"""
-        if not self.images or self.current_image_index >= len(self.images):
-            return
-            
-        try:
-            # Get current image
-            img_path = self.images[self.current_image_index]
-            with Image.open(img_path) as img:
-                # Get original dimensions
-                orig_width, orig_height = img.size
+        layout.addWidget(section_label("Options"))
+        self.progressive_cb = QCheckBox("Progressive JPEG")
+        self.progressive_cb.setToolTip("JPEG only: loads gradually on slow connections")
+        self.lqip_cb = QCheckBox("Generate LQIP placeholder")
+        self.lqip_cb.setToolTip("Also save a tiny blurred _lqip copy to show while the full image loads")
+        self.strip_meta_cb = QCheckBox("Strip metadata (EXIF, GPS)")
+        self.strip_meta_cb.setToolTip("Remove camera data and location. The color profile is kept.")
+        self.hash_names_cb = QCheckBox("Hashed filenames")
+        self.hash_names_cb.setToolTip("Name outputs by a content hash instead of the original name")
+        for checkbox in (self.progressive_cb, self.lqip_cb, self.strip_meta_cb, self.hash_names_cb):
+            layout.addWidget(checkbox)
+        layout.addStretch()
+        return page
 
-                # EXIF rotation is applied before resizing, so swap for rotated photos
-                if img.getexif().get(274) in (5, 6, 7, 8):
-                    orig_width, orig_height = orig_height, orig_width
+    def build_rename_page(self):
+        page = QWidget()
+        page.setObjectName("SettingsPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 6, 0)
+        layout.setSpacing(6)
 
-            # Get selected width
-            width_str = self.width_var.get()
-            if not width_str:
-                return
+        layout.addWidget(section_label("Bulk rename pattern"))
+        self.pattern_combo = QComboBox()
+        self.pattern_combo.addItems(core.RENAME_PATTERNS)
+        self.pattern_combo.currentTextChanged.connect(self.on_rename_options_changed)
+        layout.addWidget(self.pattern_combo)
+        self.pattern_hint = hint_label()
+        layout.addWidget(self.pattern_hint)
 
-            # Images are never upscaled
-            width = min(int(width_str), orig_width)
+        layout.addWidget(section_label("Prefix and suffix"))
+        self.prefix_edit = QLineEdit()
+        self.prefix_edit.setPlaceholderText("Prefix")
+        self.suffix_edit = QLineEdit()
+        self.suffix_edit.setPlaceholderText("Suffix")
+        for edit in (self.prefix_edit, self.suffix_edit):
+            edit.textChanged.connect(self.on_rename_options_changed)
+            layout.addWidget(edit)
 
-            # Calculate proportional height
-            height = int((width / orig_width) * orig_height)
-            self.height_var.set(str(height))
-        except Exception as e:
-            self.update_status_bar(f"Error calculating height: {str(e)}")
-            
-    def on_comp_mode_change(self):
-        """Quality only applies to lossy compression, so disable the slider otherwise"""
-        state = "normal" if self.comp_mode.get() == "lossy" else "disabled"
-        self.quality_slider.configure(state=state)
+        layout.addWidget(section_label("Date and time"))
+        date_row = QHBoxLayout()
+        self.include_date_cb = QCheckBox("Date")
+        self.include_time_cb = QCheckBox("Time")
+        for checkbox in (self.include_date_cb, self.include_time_cb):
+            checkbox.toggled.connect(self.on_rename_options_changed)
+            date_row.addWidget(checkbox)
+        date_row.addStretch()
+        layout.addLayout(date_row)
+        layout.addWidget(hint_label("The New Name column previews the result. Renaming changes the files on disk."))
+        layout.addStretch()
+        return page
 
-    def optimize_image(self, img, img_path):
-        """Apply optimizations to image based on user settings"""
-        # Apply EXIF orientation correction
-        img = ImageOps.exif_transpose(img)
+    def build_main_area(self):
+        area = QWidget()
+        area.setObjectName("MainArea")
+        layout = QVBoxLayout(area)
+        layout.setContentsMargins(16, 16, 16, 12)
 
-        # Apply other optimizations
-        if self.settings["strip_meta"]:
-            img = self.strip_metadata(img)
-
-        return img
-
-    def process_image(self, img_path):
-        """Process a single image with all optimizations and resizing"""
-        try:
-            original_size = os.path.getsize(img_path)
-
-            # Open the image (closed afterwards so the file isn't left locked)
-            with Image.open(img_path) as img:
-                # Apply orientation and optimization
-                img = self.optimize_image(img, img_path)
-
-            optimized_versions = []
-
-            # Width comes from the preset or custom entry; height always follows each
-            # image's own aspect ratio
-            resized_img = self.resize_image(img, self.settings["width"])
-            optimized_versions.append(self.save_optimized(resized_img, img_path, original_size))
-
-            # Generate LQIP if requested
-            if self.settings["lqip"]:
-                optimized_versions.append(self.generate_lqip(resized_img, img_path, original_size))
-
-            return optimized_versions
-        except Exception as e:
-            self.post_status(f"Error processing {os.path.basename(img_path)}: {str(e)}")
-            logging.error(f"Error processing {img_path}: {str(e)}")
-            return []
-
-    def resize_image(self, img, width=None, height=None):
-        """Resize image while maintaining aspect ratio (never upscales)"""
-        orig_width, orig_height = img.size
-
-        # If both dimensions are specified, fit within them
-        if width and height:
-            ratio = min(width / orig_width, height / orig_height)
-        # If only width is specified
-        elif width:
-            ratio = width / orig_width
-        # If only height is specified
-        elif height:
-            ratio = height / orig_height
-        # No dimensions specified
-        else:
-            return img
-
-        # Upscaling only adds file size, not detail
-        if ratio >= 1:
-            return img
-
-        new_size = (max(1, round(orig_width * ratio)), max(1, round(orig_height * ratio)))
-        return img.resize(new_size, Image.LANCZOS)
-
-    def strip_metadata(self, img):
-        """Remove EXIF/XMP metadata, keeping the color profile and transparency"""
-        stripped_img = img.copy()
-        stripped_img.info = {key: img.info[key] for key in ("icc_profile", "transparency") if key in img.info}
-        return stripped_img
-
-    def generate_lqip(self, img, img_path, original_size):
-        """Create Low-Quality Image Placeholder (LQIP)"""
-        # Create low-quality image placeholder
-        lqip = img.copy()
-        lqip.thumbnail((20, 20))
-        lqip = lqip.filter(ImageFilter.GaussianBlur(radius=2))
-        return self.save_optimized(lqip, img_path, original_size, suffix="_lqip")
-
-    def get_unique_output_path(self, output_path):
-        """Never overwrite a source image or another output from the same batch"""
-        def key(path):
-            return os.path.normcase(os.path.abspath(path))
-
-        base, ext = os.path.splitext(output_path)
-        counter = 1
-        while key(output_path) in self.source_paths or key(output_path) in self.batch_outputs:
-            output_path = f"{base}_{counter}{ext}"
-            counter += 1
-        self.batch_outputs.add(key(output_path))
-        return output_path
-
-    def save_optimized(self, img, img_path, original_size, suffix=""):
-        """Save optimized image with appropriate settings"""
-        settings = self.settings
-
-        # Determine output format
-        output_format = settings["format"].upper()
-        if output_format == "JPEG":
-            img = img.convert("RGB")
-
-        # Generate filename
-        original_name = os.path.splitext(os.path.basename(img_path))[0]
-
-        if settings["hash_names"]:
-            # Use hashed filenames if option is checked
-            hash_str = hashlib.md5(img.tobytes()).hexdigest()[:8]
-            file_name = f"{hash_str}{suffix}.{output_format.lower()}"
-        else:
-            # Keep original filename
-            file_name = f"{original_name}{suffix}.{output_format.lower()}"
-
-        output_path = self.get_unique_output_path(os.path.join(settings["output_dir"], file_name))
-
-        # Save options
-        lossless = settings["comp_mode"] == "lossless"
-        quality = settings["quality"]
-        save_kwargs = {}
-        if output_format == "JPEG":
-            # JPEG has no lossless mode, so use its highest quality instead
-            save_kwargs["quality"] = 100 if lossless else quality
-            if lossless:
-                save_kwargs["subsampling"] = 0
-            save_kwargs["progressive"] = settings["progressive"]
-        elif output_format == "PNG":
-            save_kwargs["optimize"] = True
-        elif output_format == "WEBP":
-            save_kwargs["lossless"] = lossless
-            # For lossless WebP, quality is compression effort rather than image quality
-            save_kwargs["quality"] = 90 if lossless else quality
-            save_kwargs["method"] = 6  # Higher compression
-        elif output_format == "AVIF":
-            # AVIF has no true lossless mode here; use maximum quality without chroma subsampling
-            save_kwargs["quality"] = 100 if lossless else quality
-            if lossless:
-                save_kwargs["subsampling"] = "4:4:4"
-
-        # Pillow drops metadata on save unless it is passed explicitly
-        exif = img.getexif()
-        if exif:
-            exif_bytes = exif.tobytes()
-            # JPEG stores EXIF in a single segment of at most 64 KB
-            if output_format != "JPEG" or len(exif_bytes) <= 65533:
-                save_kwargs["exif"] = exif_bytes
-        if img.info.get("icc_profile"):
-            save_kwargs["icc_profile"] = img.info["icc_profile"]
-
-        img.save(output_path, format=output_format, **save_kwargs)
-
-        return {
-            "path": output_path,
-            "size": os.path.getsize(output_path),
-            "original_size": original_size,
-            "dimensions": img.size
-        }
-
-    def start_processing(self):
-        """Start image optimization process"""
-        if not self.images:
-            self.update_status_bar("No images to process")
-            return
-
-        # A previous batch is still running (or still stopping after a reset)
-        if self.processing_thread and self.processing_thread.is_alive():
-            return
-
-        width_str = self.width_var.get().strip()
-        if width_str and (not width_str.isdigit() or int(width_str) == 0):
-            self.update_status_bar("Invalid width")
-            return
-
-        output_dir = filedialog.askdirectory(title="Select Output Directory")
-        if not output_dir:
-            return
-        self.output_dir = output_dir
-
-        # Snapshot settings on the main thread; the worker must not touch Tk widgets or variables
-        self.settings = {
-            "images": list(self.images),
-            "output_dir": output_dir,
-            "format": self.format_var.get(),
-            "comp_mode": self.comp_mode.get(),
-            "quality": int(self.quality_slider.get()),
-            "width": int(width_str) if width_str else None,
-            "progressive": self.progressive_var.get(),
-            "lqip": self.lqip_var.get(),
-            "strip_meta": self.strip_meta_var.get(),
-            "hash_names": self.hash_names_var.get(),
-        }
-        self.source_paths = {os.path.normcase(os.path.abspath(p)) for p in self.images}
-        self.batch_outputs = set()
-
-        # Reset processing state
-        self.processing = True
-        self.optimized_images = []
-        self.process_btn.configure(state="disabled")
-
-        # Update status to processing
-        self.update_status_bar("Processing", 0, len(self.images))
-
-        # Start processing in a separate thread
-        self.processing_thread = threading.Thread(target=self.process_images)
-        self.processing_thread.daemon = True
-        self.processing_thread.start()
-        self.after(100, self.poll_ui_queue)
-
-    def post_status(self, *args):
-        """Queue a status bar update from the worker thread"""
-        self.ui_queue.put(args)
-
-    def poll_ui_queue(self):
-        """Apply queued status updates on the main thread (Tk is not thread-safe)"""
-        running = self.processing_thread is not None and self.processing_thread.is_alive()
-        while True:
-            try:
-                args = self.ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            # Drop updates from a batch that was reset
-            if self.processing:
-                self.update_status_bar(*args)
-
-        if running:
-            self.after(100, self.poll_ui_queue)
-        else:
-            self.processing = False
-            self.process_btn.configure(state="normal")
-
-    def process_images(self):
-        """Process all images in batch mode (runs on a worker thread)"""
-        images = self.settings["images"]
-        total = len(images)
-        report_data = []
-
-        for i, img_path in enumerate(images):
-            if not self.processing:  # Allow cancellation
-                break
-
-            try:
-                # Update progress
-                self.post_status("Processing", i+1, total)
-
-                # Process image
-                optimized = self.process_image(img_path)
-                self.optimized_images.append(optimized)
-
-                # Collect report data
-                for version in optimized:
-                    original_size = version["original_size"]
-                    new_size = version["size"]
-                    savings = original_size - new_size
-                    ratio = (savings / original_size) * 100 if original_size else 0
-
-                    report_data.append({
-                        "file": os.path.basename(version["path"]),
-                        "original_size": self.format_size(original_size),
-                        "new_size": self.format_size(new_size),
-                        "savings": self.format_size(savings),
-                        "ratio": f"{ratio:.1f}%",
-                        "dimensions": version["dimensions"]
-                    })
-
-            except Exception as e:
-                self.post_status(f"Error processing {os.path.basename(img_path)}")
-                logging.error(f"Error processing {img_path}: {str(e)}")
-
-        # Generate report if processing completed
-        if self.processing:
-            try:
-                self.generate_report(report_data)
-            except Exception as e:
-                logging.error(f"Error writing report: {str(e)}")
-            self.post_status("Done", total, total)
-        
-    # ========== COMMON METHODS ==========
-    def setup_main_area(self):
-        """Set up main content area with preview and file list"""
         # Preview area
-        self.preview_frame = ctk.CTkFrame(
-            self.main_frame, 
-            fg_color="#3a3a3a",
-            corner_radius=8
-        )
-        self.preview_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
-        self.preview_frame.grid_columnconfigure(0, weight=1)
-        self.preview_frame.grid_rowconfigure(0, weight=1)
-        self.preview_frame.grid_remove()  # Hidden initially
-        
-        # Preview title
-        ctk.CTkLabel(
-            self.preview_frame, 
-            text="Optimized Preview", 
-            font=("Arial", 14, "bold"),
-            anchor="center"
-        ).grid(row=0, column=0, pady=(5, 10), sticky="n")
-        
-        # Preview container
-        self.preview_container = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
-        self.preview_container.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
-        self.preview_container.grid_columnconfigure(0, weight=1)
-        self.preview_container.grid_rowconfigure(0, weight=1)
-        
-        # Image preview label
-        self.preview_label = ctk.CTkLabel(
-            self.preview_container, 
-            text="",
-            fg_color="transparent"
-        )
-        self.preview_label.pack(fill="both", expand=True, padx=10, pady=10)
-
-        # CTkLabel can't fully remove an image (image=None leaves Tk pointing at a deleted
-        # image), so keep the shown image alive and clear the preview with a blank image instead
-        self.preview_image = None
-        self.blank_preview = ctk.CTkImage(light_image=Image.new("RGBA", (1, 1), (0, 0, 0, 0)), size=(1, 1))
+        self.preview_card, preview_header, preview_body = make_card("Preview")
+        self.preview_info = QLabel()
+        self.preview_info.setObjectName("Muted")
+        preview_header.addWidget(self.preview_info)
+        self.preview = PreviewLabel()
+        preview_body.addWidget(self.preview, 1)
 
         # File list section
-        self.file_frame = ctk.CTkFrame(
-            self.main_frame, 
-            fg_color="#3a3a3a",
-            corner_radius=8
-        )
-        self.file_frame.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="nsew")
-        self.file_frame.grid_columnconfigure(0, weight=1)
-        self.file_frame.grid_rowconfigure(0, weight=1)
-        self.file_frame.grid_remove()  # Hidden initially
-        
-        # Section title
-        ctk.CTkLabel(
-            self.file_frame, 
-            text="List of Files", 
-            font=("Arial", 14, "bold")
-        ).pack(pady=(5, 10))
-        
-        # Create Treeview for file metadata
-        tree_container = ctk.CTkFrame(self.file_frame, fg_color="transparent")
-        tree_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        
-        # Define columns for metadata
-        self.columns = (
-            "filename", "author", "size", "file_type", "extension", 
-            "date", "date_taken", "dimensions", "resolution", "camera"
-        )
-        
-        # Create Treeview with dark mode styling
-        style = ttk.Style()
-        style.theme_use("default")
-        
-        # Configure Treeview colors for dark mode
-        style.configure(
-            "Treeview",
-            background="#2a2a2a",
-            foreground="white",
-            fieldbackground="#2a2a2a",
-            font=("Arial", 10),
-            rowheight=25
-        )
-        
-        # Configure Treeview header styling
-        style.configure(
-            "Treeview.Heading",
-            background="#2b2b2b",  # Match dark theme
-            foreground="white",
-            relief="raised",  # Keep borders
-            font=("Arial", 10, "bold")
-        )
-        
-        # Hover effect for headers
-        style.map(
-            "Treeview.Heading",
-            background=[("active", "#3a3a3a")]  # Light grey on hover
-        )
-        
-        # Create Treeview
-        self.tree = ttk.Treeview(
-            tree_container,
-            columns=self.columns,
-            show="headings",
-            selectmode="browse",
-            style="Treeview"
-        )
-        
-        # Define column headings
-        self.tree.heading("filename", text="Filename")
-        self.tree.heading("author", text="Author")
-        self.tree.heading("size", text="File Size")
-        self.tree.heading("file_type", text="File Type")
-        self.tree.heading("extension", text="Extension")
-        self.tree.heading("date", text="Date")
-        self.tree.heading("date_taken", text="Date Taken")
-        self.tree.heading("dimensions", text="Dimensions")
-        self.tree.heading("resolution", text="Resolution")
-        self.tree.heading("camera", text="Camera Model")
-        
-        # Set column widths
-        self.tree.column("filename", width=120)
-        self.tree.column("author", width=80)
-        self.tree.column("size", width=80)
-        self.tree.column("file_type", width=80)
-        self.tree.column("extension", width=70)
-        self.tree.column("date", width=100)
-        self.tree.column("date_taken", width=100)
-        self.tree.column("dimensions", width=80)
-        self.tree.column("resolution", width=80)
-        self.tree.column("camera", width=100)
-        
-        # Add scrollbars
-        vsb = ttk.Scrollbar(
-            tree_container, 
-            orient="vertical", 
-            command=self.tree.yview
-        )
-        hsb = ttk.Scrollbar(
-            tree_container, 
-            orient="horizontal", 
-            command=self.tree.xview
-        )
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        
-        # Grid layout
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        
-        # Configure grid weights
-        tree_container.grid_rowconfigure(0, weight=1)
-        tree_container.grid_columnconfigure(0, weight=1)
-        
-        # Bind selection event
-        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
-        
-    def setup_status_bar(self):
-        """Create status bar at bottom of main content area"""
-        self.status_bar = ctk.CTkFrame(
-            self.main_frame, 
-            height=30,
-            fg_color="#333333"
-        )
-        self.status_bar.grid(row=2, column=0, padx=20, pady=(0, 10), sticky="ew")
-        
-        # Configure grid
-        self.status_bar.grid_columnconfigure(0, weight=0)
-        self.status_bar.grid_columnconfigure(1, weight=1)
-        self.status_bar.grid_columnconfigure(2, weight=0)
-        
-        # Status message
-        self.status_label = ctk.CTkLabel(
-            self.status_bar, 
-            text="Ready | Files: 0",
-            font=("Arial", 10)
-        )
-        self.status_label.grid(row=0, column=0, padx=(10, 5), pady=5, sticky="w")
-        
-        # Progress bar
-        self.progress = ctk.CTkProgressBar(
-            self.status_bar, 
-            mode="determinate",
-            progress_color="#FFA500"  # Start with orange
-        )
-        self.progress.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        self.progress.set(0)
-        
-        # Processing info
-        self.progress_info = ctk.CTkLabel(
-            self.status_bar, 
-            text="0/0",
-            font=("Arial", 10)
-        )
-        self.progress_info.grid(row=0, column=2, padx=(5, 10), pady=5, sticky="e")
-        
-    def update_status_bar(self, status="Ready", current=0, total=0):
+        self.files_card, files_header, files_body = make_card("Files")
+        self.files_count = QLabel()
+        self.files_count.setObjectName("Muted")
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.setObjectName("Small")
+        self.remove_btn.setToolTip("Remove the selected files from the list (Delete). Files on disk are not touched.")
+        self.remove_btn.clicked.connect(self.remove_selected)
+        files_header.insertWidget(1, self.files_count)
+        files_header.addWidget(self.remove_btn)
+
+        self.files_stack = QStackedWidget()
+        self.drop_hint = QLabel()
+        self.drop_hint.setObjectName("DropHint")
+        self.drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.table = QTableView()
+        self.table.setModel(self.model)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
+        header.setHighlightSections(False)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        for column, (key, _) in enumerate(COLUMNS):
+            self.table.setColumnWidth(column, COLUMN_WIDTHS.get(key, 100))
+        self.table.selectionModel().currentRowChanged.connect(self.on_current_row_changed)
+        self.files_stack.addWidget(self.drop_hint)
+        self.files_stack.addWidget(self.table)
+        files_body.addWidget(self.files_stack, 1)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(12)
+        splitter.addWidget(self.preview_card)
+        splitter.addWidget(self.files_card)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([340, 420])
+        layout.addWidget(splitter)
+        return area
+
+    def build_status_bar(self):
+        """Status message, progress bar and counts at the bottom of the window"""
+        bar = self.statusBar()
+        bar.setSizeGripEnabled(False)
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(12, 4, 12, 4)
+        row.setSpacing(12)
+        self.status_label = QLabel()
+        self.progress_info = QLabel()
+        self.progress_info.setObjectName("Muted")
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedSize(280, 10)
+        self.open_folder_btn = QPushButton("Open Output Folder")
+        self.open_folder_btn.setObjectName("Small")
+        self.open_folder_btn.clicked.connect(self.open_output_folder)
+        self.open_folder_btn.hide()
+        row.addWidget(self.status_label, 1)
+        row.addWidget(self.progress_info)
+        row.addWidget(self.progress)
+        row.addWidget(self.open_folder_btn)
+        bar.addPermanentWidget(container, 1)
+
+    # ========== STATE ==========
+    def is_busy(self):
+        return self.worker is not None
+
+    def set_busy(self, busy):
+        """Lock settings and file changes while a batch runs"""
+        self.run_btn.setVisible(not busy)
+        self.cancel_btn.setVisible(busy)
+        self.cancel_btn.setEnabled(True)
+        for widget in (self.browse_btn, self.optimize_mode_btn, self.rename_mode_btn,
+                       self.settings_panel, self.remove_btn):
+            widget.setEnabled(not busy)
+        if not busy:
+            self.update_files_view()
+
+    def update_status(self, status, current=0, total=0, state="ready"):
         """
         Update status bar with current status and progress
-        - Ready: Orange
-        - Processing: Red
-        - Done: Green
+        - ready: Orange
+        - processing: Red
+        - done: Green
         """
-        self.status_label.configure(text=f"{status} | Files: {len(self.images)}")
-        
+        self.status_label.setText(status)
         if total > 0:
-            percent = (current / total) * 100
-            self.progress_info.configure(text=f"{current}/{total} ({percent:.1f}%)")
+            self.progress_info.setText(f"{current}/{total} ({current / total * 100:.1f}%)")
+            self.progress.setRange(0, total)
+            self.progress.setValue(current)
         else:
-            self.progress_info.configure(text="")
-        
-        # Update progress bar color based on state
-        if status == "Ready":
-            self.progress.configure(progress_color="#FFA500")
-        elif status == "Processing":
-            self.progress.configure(progress_color="#FF0000")
-        elif status == "Done":
-            self.progress.configure(progress_color="#00FF00")
-            
-        # Set progress value
-        if total > 0:
-            self.progress.set(current / total)
-        else:
-            self.progress.set(0)
-        
-    def update_quality_label(self, value):
-        """Update quality slider label"""
-        self.quality_label.configure(text=f"Quality: {int(float(value))}%")
-            
-    def extract_metadata(self, file_path):
-        """
-        Extract comprehensive metadata from file
-        - For image files: Author, File Size, File Type, Extension
-          Date, Date Taken, Dimensions, Resolution, Camera Model
-        - For non-image files: Basic file info only
-        """
-        try:
-            # Get basic file info that applies to all file types
-            file_size = os.path.getsize(file_path)
-            file_ext = os.path.splitext(file_path)[1][1:].upper()
-            mod_date = datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%Y-%m-%d %H:%M")
-            
-            # Initialize with default values for non-image files
-            author = "N/A"
-            date_taken = "N/A"
-            dimensions = "N/A"
-            resolution = "N/A"
-            camera_model = "N/A"
-            file_type = "Other"
-            
-            # Only extract image-specific metadata for image files
-            if self.is_image_file(file_path):
-                file_type = "Image"
-                with Image.open(file_path) as img:
-                    exif_data = img.getexif()
+            self.progress_info.setText("")
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+        self.progress.setProperty("state", state)
+        repolish(self.progress)
 
-                    # Get dimensions for images
-                    dimensions = f"{img.width}×{img.height}"
-
-                    # Get resolution for images
-                    dpi = img.info.get('dpi', (0, 0))
-                    resolution = f"{dpi[0]}×{dpi[1]} DPI" if dpi[0] > 0 else "N/A"
-
-                    # Extract EXIF data for images (TIFF reads sub-IFDs from the open file)
-                    if exif_data:
-                        # Get author
-                        author = exif_data.get(315) or "N/A"
-
-                        # Get date taken (DateTimeOriginal lives in the Exif sub-IFD, not IFD0)
-                        date_taken = exif_data.get_ifd(0x8769).get(36867) or "N/A"
-
-                        # Get camera model
-                        camera_model = exif_data.get(272) or "N/A"
-            
-            return {
-                "filename": os.path.basename(file_path),
-                "author": author,
-                "size": self.format_size(file_size),
-                "file_type": file_type,
-                "extension": file_ext,
-                "date": mod_date,
-                "date_taken": date_taken,
-                "dimensions": dimensions,
-                "resolution": resolution,
-                "camera": camera_model
-            }
-            
-        except Exception as e:
-            logging.error(f"Error extracting metadata: {str(e)}")
-            return {
-                "filename": os.path.basename(file_path),
-                "author": "N/A",
-                "size": "N/A",
-                "file_type": "N/A",
-                "extension": "N/A",
-                "date": "N/A",
-                "date_taken": "N/A",
-                "dimensions": "N/A",
-                "resolution": "N/A",
-                "camera": "N/A"
-            }
-    
-    def is_image_file(self, file_path):
-        """Check if a file is an image based on its extension"""
-        image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.gif', '.webp')
-        return os.path.splitext(file_path)[1].lower() in image_extensions
-    
-    def update_file_list(self):
-        """Populate treeview with file metadata"""
-        # Clear existing items
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        
-        # Add new items
-        for meta in self.image_metadata:
-            self.tree.insert("", "end", values=(
-                meta["filename"],
-                meta["author"],
-                meta["size"],
-                meta["file_type"],
-                meta["extension"],
-                meta["date"],
-                meta["date_taken"],
-                meta["dimensions"],
-                meta["resolution"],
-                meta["camera"]
-            ))
-        
-        # Select first item if available
-        if self.image_metadata:
-            first_item = self.tree.get_children()[0]
-            self.tree.selection_set(first_item)
-            self.tree.focus(first_item)
-            
-    def on_tree_select(self, event):
-        """Handle file selection from treeview - update preview if image"""
-        selected = self.tree.selection()
-        if selected:
-            index = self.tree.index(selected[0])
-            if 0 <= index < len(self.images):
-                self.current_image_index = index
-                
-                # Only show preview for image files in optimize mode
-                if (self.mode_var.get() == "optimize" and 
-                    self.is_image_file(self.images[self.current_image_index])):
-                    self.show_image()
-                    self.update_height_display()
-                
-    def show_work_area(self):
-        """Show preview and file list when files are loaded"""
-        # Always show file list
-        self.file_frame.grid()
-        
-        # Only show preview in optimization mode for images
-        if self.mode_var.get() == "optimize" and self.images:
-            self.preview_frame.grid()
-        
-        self.status_bar.grid()
-        
-    def show_image(self):
-        """Display the selected image in the preview area (only for image files)"""
-        if not self.images or self.current_image_index >= len(self.images):
-            return
-            
-        img_path = self.images[self.current_image_index]
-        if not self.is_image_file(img_path):
-            return
-            
-        try:
-            # Open and apply orientation correction
-            with Image.open(img_path) as img:
-                img = ImageOps.exif_transpose(img)  # Fix orientation
-
-                # Resize for preview
-                img.thumbnail((600, 600))
-            
-            # Create CTkImage and display
-            img_tk = ctk.CTkImage(light_image=img, size=img.size)
-            self.preview_label.configure(image=img_tk, text="")
-            self.preview_image = img_tk
-            
-        except Exception as e:
-            self.update_status_bar(f"Error: {str(e)}")
-            
-    def format_size(self, size):
-        """Convert bytes to human-readable format"""
-        if size == 0:
-            return "0B"
-        # Savings are negative when the output is larger than the original
-        sign = "-" if size < 0 else ""
-        size = abs(size)
-        size_name = ("B", "KB", "MB", "GB", "TB")
-        i = min(int(math.floor(math.log(size, 1024))), len(size_name) - 1)
-        p = math.pow(1024, i)
-        s = round(size / p, 2)
-        return f"{sign}{s} {size_name[i]}"
-
-    def generate_report(self, data):
-        """Generate optimization reports in JSON and HTML formats"""
-        output_dir = self.settings["output_dir"]
-        report_path = os.path.join(output_dir, "optimization_report.json")
-        with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-
-        # Generate HTML report
-        html_path = os.path.join(output_dir, "report.html")
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write('<html><head><meta charset="utf-8"><style>')
-            f.write("body { font-family: Arial, sans-serif; }")
-            f.write("table { border-collapse: collapse; width: 100%; }")
-            f.write("th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }")
-            f.write("tr:nth-child(even) { background-color: #f2f2f2; }")
-            f.write("th { background-color: #4CAF50; color: white; }")
-            f.write("</style></head><body>")
-            f.write("<h1>Image Optimization Report</h1>")
-            f.write("<table>")
-            f.write("<tr>")
-            f.write("<th>File</th><th>Original</th><th>Optimized</th><th>Savings</th><th>Ratio</th><th>Dimensions</th>")
-            f.write("</tr>")
-            
-            for item in data:
-                f.write("<tr>")
-                f.write(f"<td>{html.escape(item['file'])}</td>")
-                f.write(f"<td>{item['original_size']}</td>")
-                f.write(f"<td>{item['new_size']}</td>")
-                f.write(f"<td>{item['savings']}</td>")
-                f.write(f"<td>{item['ratio']}</td>")
-                f.write(f"<td>{item['dimensions'][0]}x{item['dimensions'][1]}</td>")
-                f.write("</tr>")
-                
-            f.write("</table></body></html>")
-    
-    def reset_application(self):
-        """Reset the application to initial state"""
-        # Clear all data
-        self.images = []
-        self.image_metadata = []
-        self.optimized_images = []
-        self.current_image_index = 0
-        self.output_dir = ""
-        self.processing = False
-        
-        # Reset UI elements - clear Treeview explicitly
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        self.preview_label.configure(image=self.blank_preview, text="")
-        self.preview_image = None
-        self.update_status_bar("Ready")
-        
-        # Hide the preview and file list sections
-        self.preview_frame.grid_remove()
-        self.file_frame.grid_remove()
-        
-        # Reset settings to defaults
-        self.format_var.set("webp")
-        self.comp_mode.set("lossy")  # Set back to lossy
-        self.quality_slider.set(80)
-        self.quality_label.configure(text="Quality: 80%")
+    def reset_settings(self):
+        """Restore all controls to their defaults"""
+        defaults = core.DEFAULT_SETTINGS
+        self.format_buttons[defaults["format"]].setChecked(True)
+        (self.lossy_rb if defaults["comp_mode"] == "lossy" else self.lossless_rb).setChecked(True)
+        self.quality_slider.setValue(defaults["quality"])
+        self.size_combo.setCurrentText(defaults["size_preset"])
+        self.on_size_preset_select(defaults["size_preset"])
+        self.progressive_cb.setChecked(defaults["progressive"])
+        self.lqip_cb.setChecked(defaults["lqip"])
+        self.strip_meta_cb.setChecked(defaults["strip_meta"])
+        self.hash_names_cb.setChecked(defaults["hash_names"])
         self.on_comp_mode_change()
-        self.size_presets.set("Full HD (1920px)")
-        self.width_var.set("1920")
-        self.height_var.set("")
-        self.width_entry.configure(state="disabled")
-        self.progressive_var.set(True)
-        self.lqip_var.set(False)
-        self.strip_meta_var.set(False)
-        self.hash_names_var.set(False)  # Default to unchecked
-        
-        # Reset renaming controls
-        self.rename_format_var.set("Sequential Numbering")
-        self.prefix_var.set("")
-        self.suffix_var.set("")
-        self.include_date_var.set(True)
-        self.include_time_var.set(True)
-        
-        # Set back to optimization mode
-        self.toggle_mode("optimize")
+
+        rename_defaults = core.DEFAULT_RENAME_OPTIONS
+        self.pattern_combo.setCurrentText(rename_defaults["pattern"])
+        self.prefix_edit.setText(rename_defaults["prefix"])
+        self.suffix_edit.setText(rename_defaults["suffix"])
+        self.include_date_cb.setChecked(rename_defaults["include_date"])
+        self.include_time_cb.setChecked(rename_defaults["include_time"])
+        self.on_rename_options_changed()
+
+    def set_mode(self, mode):
+        """Switch between image optimizing and file renaming"""
+        self.mode = mode
+        is_optimize = mode == "optimize"
+        self.optimize_mode_btn.setChecked(is_optimize)
+        self.rename_mode_btn.setChecked(not is_optimize)
+        self.optimize_page.setVisible(is_optimize)
+        self.rename_page.setVisible(not is_optimize)
+        self.preview_card.setVisible(is_optimize)
+        self.table.setColumnHidden(NEW_NAME_COLUMN, is_optimize)
+        self.browse_btn.setText("Add Images…" if is_optimize else "Add Files…")
+        self.run_btn.setText("Optimize Images" if is_optimize else "Apply Rename")
+        self.run_btn.setObjectName("Primary" if is_optimize else "Rename")
+        repolish(self.run_btn)
+        self.drop_hint.setText(("Drop images or folders here" if is_optimize else "Drop files or folders here")
+                               + "\nor use the Add button")
+
+        # Only images can be optimized
+        if is_optimize:
+            rows = [i for i, path in enumerate(self.model.paths) if not core.is_image_file(path)]
+            if rows:
+                self.model.remove_rows(rows)
+        self.model.refresh_new_names()
+        self.update_files_view()
+        if is_optimize:
+            self.on_current_row_changed(self.table.currentIndex(), None)
+        self.update_status("Ready")
+
+    def update_files_view(self):
+        """Show the drop hint or the table, and keep counts in sync"""
+        count = self.model.rowCount()
+        self.files_stack.setCurrentIndex(1 if count else 0)
+        self.files_count.setText(f"{count} file{'s' if count != 1 else ''}" if count else "")
+        self.remove_btn.setEnabled(bool(count) and not self.is_busy())
+        if not count:
+            self.preview_path = None
+            self.preview_info.setText("")
+            self.preview.set_message("Add images to see a preview")
+            self.output_size_label.setText("")
+
+    # ========== FILES ==========
+    def browse_files(self):
+        """Open file dialog to add files"""
+        if self.is_busy():
+            return
+        start_dir = self.settings_store.value("last_input_dir", "")
+        if self.mode == "optimize":
+            patterns = " ".join("*" + ext for ext in core.IMAGE_EXTENSIONS)
+            files, _ = QFileDialog.getOpenFileNames(self, "Select Images", start_dir,
+                                                    f"Image files ({patterns});;All files (*.*)")
+        else:
+            files, _ = QFileDialog.getOpenFileNames(self, "Select Files", start_dir, "All files (*.*)")
+        if files:
+            self.settings_store.setValue("last_input_dir", os.path.dirname(files[0]))
+            self.add_files(files)
+
+    def add_files(self, paths, done_status="Ready"):
+        """Add files to the list; metadata is read in the background"""
+        if self.mode == "optimize":
+            paths = [p for p in paths if core.is_image_file(p)]
+        if not paths:
+            self.update_status("No valid files found")
+            return
+
+        known = {core.path_key(p) for p in self.model.paths} | self.pending_keys
+        new_paths = []
+        for path in paths:
+            path = os.path.normpath(path)
+            key = core.path_key(path)
+            if key not in known:
+                known.add(key)
+                new_paths.append(path)
+        if not new_paths:
+            self.update_status("Those files are already in the list")
+            return
+
+        self.pending_keys.update(core.path_key(p) for p in new_paths)
+        self.load_done_status = done_status
+        loader = MetadataLoader(self.load_generation, new_paths)
+        loader.signals.loaded.connect(self.on_metadata_loaded)
+        loader.signals.finished.connect(self.on_metadata_finished)
+        self.start_job(loader)
+        self.update_status(f"Reading {len(new_paths)} file{'s' if len(new_paths) != 1 else ''}…")
+
+    def start_job(self, job):
+        self.jobs[job.signals] = job
+        self.pool.start(job)
+
+    def on_metadata_loaded(self, generation, rows):
+        if generation != self.load_generation:
+            return
+        for path, _ in rows:
+            self.pending_keys.discard(core.path_key(path))
+        # The mode may have changed to optimize while non-image files were loading
+        rows = [(p, m) for p, m in rows if self.mode == "rename" or core.is_image_file(p)]
+        was_empty = self.model.rowCount() == 0
+        self.model.add_rows(rows)
+        self.update_files_view()
+        if was_empty and self.model.rowCount():
+            self.table.setCurrentIndex(self.model.index(0, 0))
+
+    def on_metadata_finished(self, generation):
+        self.jobs.pop(self.sender(), None)
+        if generation == self.load_generation and not self.pending_keys and not self.is_busy():
+            self.update_status(self.load_done_status)
+
+    def remove_selected(self):
+        """Remove selected rows from the list (files on disk are not touched)"""
+        if self.is_busy():
+            return
+        rows = [index.row() for index in self.table.selectionModel().selectedRows()]
+        if rows:
+            self.model.remove_rows(rows)
+            self.model.refresh_new_names()
+            self.update_files_view()
+            self.update_status(f"Removed {len(rows)} file{'s' if len(rows) != 1 else ''} from the list")
+
+    def current_row(self):
+        row = self.table.currentIndex().row()
+        return row if 0 <= row < len(self.model.paths) else None
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls() and not self.is_busy():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls() and not self.is_busy():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        """Add dropped files, and the files directly inside dropped folders"""
+        paths = []
+        for url in event.mimeData().urls():
+            local = url.toLocalFile()
+            if os.path.isdir(local):
+                paths.extend(os.path.join(local, name) for name in sorted(os.listdir(local))
+                             if os.path.isfile(os.path.join(local, name)))
+            elif os.path.isfile(local):
+                paths.append(local)
+        if paths:
+            self.add_files(paths)
+        event.acceptProposedAction()
+
+    # ========== PREVIEW ==========
+    def on_current_row_changed(self, current, previous):
+        """Handle file selection - update preview and output size for images"""
+        row = self.current_row()
+        if row is None or self.mode != "optimize":
+            return
+        path = self.model.paths[row]
+        meta = self.model.metadata[row]
+        self.preview_path = path
+        self.preview_info.setText(f"{meta['filename']}   ·   {meta['dimensions']}   ·   {meta['size']}")
+        self.update_output_size()
+        cached = self.preview_cache.get(path)
+        if cached is not None:
+            self.preview.set_image(QPixmap.fromImage(cached))
+        else:
+            self.preview.set_message("Loading preview…")
+            self.preview_timer.start()
+
+    def load_current_preview(self):
+        if self.preview_path and self.preview_path not in self.preview_cache:
+            loader = PreviewLoader(self.preview_path)
+            loader.signals.ready.connect(self.on_preview_ready)
+            self.start_job(loader)
+
+    def on_preview_ready(self, path, image):
+        self.jobs.pop(self.sender(), None)
+        if not image.isNull():
+            self.preview_cache[path] = image
+            while len(self.preview_cache) > PREVIEW_CACHE_SIZE:
+                self.preview_cache.pop(next(iter(self.preview_cache)))
+        if path != self.preview_path:
+            return
+        if image.isNull():
+            self.preview.set_message("Preview not available")
+        else:
+            self.preview.set_image(QPixmap.fromImage(image))
+
+    # ========== IMAGE OPTIMIZATION ==========
+    def on_comp_mode_change(self):
+        """Quality only applies to lossy compression, so disable the slider otherwise"""
+        lossy = self.lossy_rb.isChecked()
+        self.quality_slider.setEnabled(lossy)
+        self.quality_title.setEnabled(lossy)
+        self.quality_value.setEnabled(lossy)
+        if lossy:
+            self.comp_hint.setText("Smaller files. 75–85% suits most photos.")
+        else:
+            self.comp_hint.setText("Exact pixels, much larger files. WebP and PNG are truly lossless; "
+                                   "JPEG and AVIF use their highest quality.")
+
+    def on_size_preset_select(self, choice):
+        """Handle size preset selection and update the width field"""
+        width = core.SIZE_PRESETS.get(choice)
+        custom = width is None
+        self.width_edit.setEnabled(custom)
+        self.width_edit.setText("" if custom else str(width))
+        if custom:
+            self.width_edit.setFocus()
+        self.update_output_size()
+
+    def requested_width(self):
+        text = self.width_edit.text().strip()
+        return int(text) if text.isdigit() and int(text) > 0 else None
+
+    def update_output_size(self):
+        """Show the output size of the selected image (height follows its aspect ratio)"""
+        row = self.current_row()
+        if row is None or self.mode != "optimize":
+            self.output_size_label.setText("")
+            return
+        try:
+            width, height = core.output_dimensions(self.model.paths[row], self.requested_width())
+            self.output_size_label.setText(f"Selected image → {width} × {height} px")
+        except Exception as e:
+            self.output_size_label.setText("")
+            logging.error(f"Error calculating output size: {str(e)}")
+
+    def current_format(self):
+        return next(fmt for fmt, button in self.format_buttons.items() if button.isChecked())
+
+    def run_action(self):
+        if self.mode == "optimize":
+            self.start_processing()
+        else:
+            self.apply_rename()
+
+    def start_processing(self):
+        """Start image optimization on a worker thread"""
+        if self.is_busy():
+            return
+        if not self.model.paths:
+            self.update_status("No images to process")
+            return
+        if self.pending_keys:
+            self.update_status("Still reading files, try again in a moment")
+            return
+        width_text = self.width_edit.text().strip()
+        if width_text and self.requested_width() is None:
+            self.update_status("Invalid width")
+            return
+
+        start_dir = self.settings_store.value("last_output_dir", "")
+        output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory", start_dir)
+        if not output_dir:
+            return
+        self.settings_store.setValue("last_output_dir", output_dir)
+
+        # Snapshot settings; the worker never touches widgets
+        settings = {
+            "images": list(self.model.paths),
+            "output_dir": output_dir,
+            "format": self.current_format(),
+            "comp_mode": "lossy" if self.lossy_rb.isChecked() else "lossless",
+            "quality": self.quality_slider.value(),
+            "width": self.requested_width(),
+            "progressive": self.progressive_cb.isChecked(),
+            "lqip": self.lqip_cb.isChecked(),
+            "strip_meta": self.strip_meta_cb.isChecked(),
+            "hash_names": self.hash_names_cb.isChecked(),
+        }
+        self.open_folder_btn.hide()
+        self.worker = OptimizeWorker(settings)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.done.connect(self.on_batch_done)
+        self.set_busy(True)
+        self.update_status("Processing…", 0, len(settings["images"]), "processing")
+        self.worker.start()
+
+    def on_progress(self, done, total, name):
+        if self.worker and not self.worker.silent:
+            status = f"Processing {name}…" if name else "Writing report…"
+            self.update_status(status, done, total, "processing")
+
+    def on_batch_done(self, total, written, errors, cancelled, output_dir):
+        worker = self.worker
+        self.worker = None
+        worker.wait()
+        self.set_busy(False)
+        if worker.silent:
+            self.update_status("Ready")
+            return
+        if cancelled:
+            self.update_status(f"Cancelled after {self.progress.value()} of {total} images")
+            return
+        status = f"Done: {written} file{'s' if written != 1 else ''} saved"
+        if errors:
+            status += f", {errors} failed (see image_optimizer.log)"
+        self.update_status(status, total, total, "done")
+        self.last_output_dir = output_dir
+        self.open_folder_btn.show()
+
+    def cancel_processing(self):
+        if self.worker:
+            self.worker.cancel()
+            self.cancel_btn.setEnabled(False)
+            self.update_status("Stopping after the current image…", self.progress.value(),
+                               self.progress.maximum(), "processing")
+
+    def open_output_folder(self):
+        if self.last_output_dir:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output_dir))
+
+    # ========== FILE RENAMING ==========
+    def rename_options(self):
+        return {
+            "pattern": self.pattern_combo.currentText(),
+            "prefix": self.prefix_edit.text(),
+            "suffix": self.suffix_edit.text(),
+            "include_date": self.include_date_cb.isChecked(),
+            "include_time": self.include_time_cb.isChecked(),
+        }
+
+    def preview_new_name(self, path, index):
+        return core.generate_new_filename(path, index, self.rename_options())
+
+    def on_rename_options_changed(self, *args):
+        self.pattern_hint.setText(RENAME_HINTS.get(self.pattern_combo.currentText(), ""))
+        self.model.refresh_new_names()
+
+    def apply_rename(self):
+        """Apply the selected renaming pattern to all listed files"""
+        if not self.model.paths:
+            self.update_status("No files to rename")
+            return
+        if self.pending_keys:
+            self.update_status("Still reading files, try again in a moment")
+            return
+        count = len(self.model.paths)
+        answer = QMessageBox.question(
+            self, "Apply Rename",
+            f"Rename {count} file{'s' if count != 1 else ''} on disk using \"{self.pattern_combo.currentText()}\"?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        new_paths, renamed_count, error = core.rename_files(self.model.paths, self.rename_options())
+        status = f"Error renaming files: {error}" if error else f"Renamed {renamed_count} files successfully"
+
+        # Reload the list so names and metadata reflect the files on disk
+        self.load_generation += 1
+        self.pending_keys.clear()
+        self.model.clear()
+        self.update_files_view()
+        self.add_files(new_paths, done_status=status)
+
+    # ========== RESET ==========
+    def reset_application(self):
+        """Reset the application to its initial state"""
+        if self.worker:
+            # The batch stops after its current image; its result is discarded
+            self.worker.silent = True
+            self.worker.cancel()
+        self.load_generation += 1
+        self.pending_keys.clear()
+        self.model.clear()
+        self.preview_cache.clear()
+        self.open_folder_btn.hide()
+        self.reset_settings()
+        self.set_mode("optimize")
+        if self.worker:
+            self.cancel_btn.setEnabled(False)
+            self.update_status("Stopping…")
+
+    def closeEvent(self, event):
+        if self.worker:
+            self.worker.cancel()
+            self.worker.wait()
+        self.pool.waitForDone(5000)
+        super().closeEvent(event)
+
+
+def log_uncaught_exception(exc_type, exc_value, exc_traceback):
+    """Errors inside Qt callbacks would otherwise vanish under pythonw"""
+    logging.error("Unhandled error", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+def create_app(argv):
+    app = QApplication(argv)
+    app.setApplicationName("Image Optimizer Pro")
+    app.setStyle("Fusion")
+    app.setPalette(dark_palette())
+    app.setStyleSheet(build_stylesheet())
+    return app
+
+
+def main():
+    sys.excepthook = log_uncaught_exception
+    if sys.platform == "win32":
+        try:
+            # Show the app's own icon in the taskbar instead of Python's
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ImageOptimizerPro")
+        except Exception:
+            pass
+    app = create_app(sys.argv)
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
 
 if __name__ == "__main__":
     try:
-        app = ImageOptimizerApp()
-        app.mainloop()
+        sys.exit(main())
     except Exception as e:
         logging.exception("Critical error occurred")
         try:
-            import tkinter.messagebox
-            tkinter.messagebox.showerror(
-                "Fatal Error",
-                f"Application crashed: {str(e)}\nCheck image_optimizer.log for details"
-            )
-        except:
+            QMessageBox.critical(None, "Fatal Error",
+                                 f"Application crashed: {str(e)}\nCheck image_optimizer.log for details")
+        except Exception:
             pass
