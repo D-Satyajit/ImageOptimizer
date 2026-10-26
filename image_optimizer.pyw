@@ -123,11 +123,11 @@ class ImageOptimizerApp(ctk.CTk):
             )
             rb.grid(row=i+1, column=0, padx=20, pady=(0, 2), sticky="w")
         
-        # Compression settings - default to lossless
+        # Compression settings - default to lossy at quality 80
         comp_label = ctk.CTkLabel(self.optimize_frame, text="Compression:", anchor="w")
         comp_label.grid(row=5, column=0, padx=20, pady=(10, 0), sticky="w")
         
-        self.comp_mode = ctk.StringVar(value="lossless")  # Set default to lossless
+        self.comp_mode = ctk.StringVar(value="lossy")  # Set default to lossy
         lossless_rb = ctk.CTkRadioButton(
             self.optimize_frame, 
             text="Lossless", 
@@ -151,7 +151,7 @@ class ImageOptimizerApp(ctk.CTk):
         lossy_rb.grid(row=7, column=0, padx=20, pady=(0, 10), sticky="w")
         
         # Quality slider
-        self.quality_label = ctk.CTkLabel(self.optimize_frame, text="Quality: 100%")
+        self.quality_label = ctk.CTkLabel(self.optimize_frame, text="Quality: 80%")
         self.quality_label.grid(row=8, column=0, padx=20, pady=(0, 0), sticky="w")
         
         self.quality_slider = ctk.CTkSlider(
@@ -161,7 +161,7 @@ class ImageOptimizerApp(ctk.CTk):
             number_of_steps=90,
             command=self.update_quality_label
         )
-        self.quality_slider.set(100)
+        self.quality_slider.set(80)
         self.quality_slider.grid(row=9, column=0, padx=20, pady=(5, 10), sticky="ew")
         self.on_comp_mode_change()
 
@@ -1378,9 +1378,9 @@ class ImageOptimizerApp(ctk.CTk):
         
         # Reset settings to defaults
         self.format_var.set("webp")
-        self.comp_mode.set("lossless")  # Set back to lossless
-        self.quality_slider.set(100)
-        self.quality_label.configure(text="Quality: 100%")
+        self.comp_mode.set("lossy")  # Set back to lossy
+        self.quality_slider.set(80)
+        self.quality_label.configure(text="Quality: 80%")
         self.on_comp_mode_change()
         self.size_presets.set("Full HD (1920px)")
         self.width_var.set("1920")
