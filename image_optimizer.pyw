@@ -3,7 +3,9 @@ from PIL import Image, ImageOps, ImageFilter
 from PIL.ExifTags import TAGS
 import os
 import hashlib
+import html
 import json
+import queue
 import tkinter as tk
 from tkinter import filedialog, ttk
 import threading
@@ -12,9 +14,9 @@ import logging
 from datetime import datetime
 import re
 
-# Configure error logging
+# Configure error logging (next to the script, regardless of working directory)
 logging.basicConfig(
-    filename='image_optimizer.log',
+    filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'image_optimizer.log'),
     level=logging.ERROR,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
@@ -59,7 +61,11 @@ class ImageOptimizerApp(ctk.CTk):
         self.output_dir = ""
         self.processing_thread = None
         self.processing = False
-        
+        self.ui_queue = queue.Queue()  # Status updates from the worker thread
+        self.settings = {}  # Settings snapshot for the current batch
+        self.source_paths = set()
+        self.batch_outputs = set()
+
         # Set up UI components
         self.setup_sidebar()
         self.setup_main_area()
@@ -128,16 +134,18 @@ class ImageOptimizerApp(ctk.CTk):
             variable=self.comp_mode, 
             value="lossless",
             font=("Arial", 10),
+            command=self.on_comp_mode_change,
             **yellow_style
         )
         lossless_rb.grid(row=6, column=0, padx=20, pady=(0, 2), sticky="w")
-        
+
         lossy_rb = ctk.CTkRadioButton(
-            self.optimize_frame, 
-            text="Lossy", 
-            variable=self.comp_mode, 
+            self.optimize_frame,
+            text="Lossy",
+            variable=self.comp_mode,
             value="lossy",
             font=("Arial", 10),
+            command=self.on_comp_mode_change,
             **yellow_style
         )
         lossy_rb.grid(row=7, column=0, padx=20, pady=(0, 10), sticky="w")
@@ -155,7 +163,8 @@ class ImageOptimizerApp(ctk.CTk):
         )
         self.quality_slider.set(100)
         self.quality_slider.grid(row=9, column=0, padx=20, pady=(5, 10), sticky="ew")
-        
+        self.on_comp_mode_change()
+
         # Responsive sizes
         size_label = ctk.CTkLabel(self.optimize_frame, text="Responsive Sizes:", anchor="w")
         size_label.grid(row=10, column=0, padx=20, pady=(5, 0), sticky="w")
@@ -249,7 +258,7 @@ class ImageOptimizerApp(ctk.CTk):
         rename_label.grid(row=0, column=0, padx=20, pady=(5, 0), sticky="w")
         
         # Renaming format selection
-        self.rename_format_var = ctk.StringVar(value="sequential")
+        self.rename_format_var = ctk.StringVar(value="Sequential Numbering")
         rename_formats = [
             "Sequential Numbering",
             "Alphanumeric Pattern",
@@ -458,8 +467,12 @@ class ImageOptimizerApp(ctk.CTk):
             return f"image_{index+1}{ext}"
         
         elif pattern == "Alphanumeric Pattern":
-            # Generate pattern: img_A1, img_B2, etc.
-            letter = chr(65 + (index // 10))  # A, B, C...
+            # Generate pattern: img_A1 ... img_A10, img_B1 ... img_Z10, img_AA1, etc.
+            letter = ""
+            group = index // 10
+            while group >= 0:
+                letter = chr(65 + group % 26) + letter
+                group = group // 26 - 1
             number = index % 10 + 1
             return f"img_{letter}{number}{ext}"
         
@@ -508,7 +521,7 @@ class ImageOptimizerApp(ctk.CTk):
     
     def update_rename_preview(self, *args):
         """Update the file list to show preview of new filenames"""
-        if not self.images:
+        if not self.images or self.mode_var.get() != "rename":
             return
             
         # Update treeview with new names
@@ -546,10 +559,11 @@ class ImageOptimizerApp(ctk.CTk):
                 if os.path.basename(path) == new_name:
                     continue
                 
-                # Handle filename conflicts
+                # Handle filename conflicts (a case-only rename on Windows matches the file itself)
                 counter = 1
                 base_new_path = new_path
-                while os.path.exists(new_path):
+                while (os.path.exists(new_path) and
+                       os.path.normcase(os.path.abspath(new_path)) != os.path.normcase(os.path.abspath(path))):
                     name, ext = os.path.splitext(base_new_path)
                     new_path = f"{name}_{counter}{ext}"
                     counter += 1
@@ -612,245 +626,283 @@ class ImageOptimizerApp(ctk.CTk):
         try:
             # Get current image
             img_path = self.images[self.current_image_index]
-            img = Image.open(img_path)
-            
-            # Get original dimensions
-            orig_width, orig_height = img.size
-            
+            with Image.open(img_path) as img:
+                # Get original dimensions
+                orig_width, orig_height = img.size
+
+                # EXIF rotation is applied before resizing, so swap for rotated photos
+                if img.getexif().get(274) in (5, 6, 7, 8):
+                    orig_width, orig_height = orig_height, orig_width
+
             # Get selected width
             width_str = self.width_var.get()
             if not width_str:
                 return
-                
-            width = int(width_str)
-            
+
+            # Images are never upscaled
+            width = min(int(width_str), orig_width)
+
             # Calculate proportional height
             height = int((width / orig_width) * orig_height)
             self.height_var.set(str(height))
         except Exception as e:
             self.update_status_bar(f"Error calculating height: {str(e)}")
             
+    def on_comp_mode_change(self):
+        """Quality only applies to lossy compression, so disable the slider otherwise"""
+        state = "normal" if self.comp_mode.get() == "lossy" else "disabled"
+        self.quality_slider.configure(state=state)
+
     def optimize_image(self, img, img_path):
         """Apply optimizations to image based on user settings"""
         # Apply EXIF orientation correction
         img = ImageOps.exif_transpose(img)
-        
+
         # Apply other optimizations
-        if self.strip_meta_var.get():
+        if self.settings["strip_meta"]:
             img = self.strip_metadata(img)
-            
-        if self.comp_mode.get() == "lossy":
-            quality = int(self.quality_slider.get())
-            if self.format_var.get() == "jpeg":
-                img = img.convert("RGB")
-                
+
         return img
-            
+
     def process_image(self, img_path):
         """Process a single image with all optimizations and resizing"""
         try:
-            # Open the image
-            img = Image.open(img_path)
-            
-            # Apply orientation and optimization
-            img = self.optimize_image(img, img_path)
-            
-            # For processing, handle sizes
+            original_size = os.path.getsize(img_path)
+
+            # Open the image (closed afterwards so the file isn't left locked)
+            with Image.open(img_path) as img:
+                # Apply orientation and optimization
+                img = self.optimize_image(img, img_path)
+
             optimized_versions = []
-            sizes = []
-            
-            # Get custom sizes if specified
-            custom_width = self.width_var.get().strip()
-            custom_height = self.height_var.get().strip()
-            
-            if custom_width or custom_height:
-                try:
-                    width = int(custom_width) if custom_width else None
-                    height = int(custom_height) if custom_height else None
-                    sizes.append((width, height))
-                except ValueError:
-                    pass
-            else:
-                # Use preset sizes
-                preset = self.size_presets.get()
-                if preset == "Mobile (480px)":
-                    sizes.append((480, None))
-                elif preset == "Tablet (768px)":
-                    sizes.append((768, None))
-                elif preset == "Desktop (1080px)":
-                    sizes.append((1080, None))
-                elif preset == "Full HD (1920px)":
-                    sizes.append((1920, None))
-                # Handle new 2K resolution
-                elif preset == "2K (2560px)":
-                    sizes.append((2560, None))
-                # Handle new 4K resolution
-                elif preset == "4K (3840px)":
-                    sizes.append((3840, None))
-            
-            # Process each size
-            for size in sizes:
-                width, height = size
-                resized_img = self.resize_image(img.copy(), width, height)
-                optimized_img = self.save_optimized(resized_img, img_path, width, height)
-                optimized_versions.append(optimized_img)
-                
-                # Generate LQIP if requested
-                if self.lqip_var.get():
-                    lqip_img = self.generate_lqip(resized_img, img_path)
-                    optimized_versions.append(lqip_img)
-                    
+
+            # Width comes from the preset or custom entry; height always follows each
+            # image's own aspect ratio
+            resized_img = self.resize_image(img, self.settings["width"])
+            optimized_versions.append(self.save_optimized(resized_img, img_path, original_size))
+
+            # Generate LQIP if requested
+            if self.settings["lqip"]:
+                optimized_versions.append(self.generate_lqip(resized_img, img_path, original_size))
+
             return optimized_versions
         except Exception as e:
-            self.update_status_bar(f"Error processing {os.path.basename(img_path)}: {str(e)}")
+            self.post_status(f"Error processing {os.path.basename(img_path)}: {str(e)}")
             logging.error(f"Error processing {img_path}: {str(e)}")
             return []
-        
+
     def resize_image(self, img, width=None, height=None):
-        """Resize image while maintaining aspect ratio"""
+        """Resize image while maintaining aspect ratio (never upscales)"""
         orig_width, orig_height = img.size
-        
-        # If both dimensions are specified
+
+        # If both dimensions are specified, fit within them
         if width and height:
-            # Calculate the ratio to fit within the given dimensions
             ratio = min(width / orig_width, height / orig_height)
-            new_width = int(orig_width * ratio)
-            new_height = int(orig_height * ratio)
-            new_size = (new_width, new_height)
         # If only width is specified
         elif width:
             ratio = width / orig_width
-            new_height = int(orig_height * ratio)
-            new_size = (width, new_height)
         # If only height is specified
         elif height:
             ratio = height / orig_height
-            new_width = int(orig_width * ratio)
-            new_size = (new_width, height)
         # No dimensions specified
         else:
             return img
-            
+
+        # Upscaling only adds file size, not detail
+        if ratio >= 1:
+            return img
+
+        new_size = (max(1, round(orig_width * ratio)), max(1, round(orig_height * ratio)))
         return img.resize(new_size, Image.LANCZOS)
-        
+
     def strip_metadata(self, img):
-        """Remove EXIF metadata from image"""
-        # Create new image without metadata
-        data = list(img.getdata())
-        if img.mode == 'P':
-            # Palette mode needs special handling
-            stripped_img = Image.new(img.mode, img.size)
-            stripped_img.putdata(data)
-            stripped_img.putpalette(img.getpalette())
-        else:
-            stripped_img = Image.new(img.mode, img.size)
-            stripped_img.putdata(data)
+        """Remove EXIF/XMP metadata, keeping the color profile and transparency"""
+        stripped_img = img.copy()
+        stripped_img.info = {key: img.info[key] for key in ("icc_profile", "transparency") if key in img.info}
         return stripped_img
-        
-    def generate_lqip(self, img, img_path):
+
+    def generate_lqip(self, img, img_path, original_size):
         """Create Low-Quality Image Placeholder (LQIP)"""
         # Create low-quality image placeholder
         lqip = img.copy()
         lqip.thumbnail((20, 20))
         lqip = lqip.filter(ImageFilter.GaussianBlur(radius=2))
-        return self.save_optimized(lqip, img_path, suffix="_lqip")
-        
-    def save_optimized(self, img, img_path, width=None, height=None, suffix=""):
+        return self.save_optimized(lqip, img_path, original_size, suffix="_lqip")
+
+    def get_unique_output_path(self, output_path):
+        """Never overwrite a source image or another output from the same batch"""
+        def key(path):
+            return os.path.normcase(os.path.abspath(path))
+
+        base, ext = os.path.splitext(output_path)
+        counter = 1
+        while key(output_path) in self.source_paths or key(output_path) in self.batch_outputs:
+            output_path = f"{base}_{counter}{ext}"
+            counter += 1
+        self.batch_outputs.add(key(output_path))
+        return output_path
+
+    def save_optimized(self, img, img_path, original_size, suffix=""):
         """Save optimized image with appropriate settings"""
+        settings = self.settings
+
         # Determine output format
-        output_format = self.format_var.get().upper()
+        output_format = settings["format"].upper()
         if output_format == "JPEG":
             img = img.convert("RGB")
-            
+
         # Generate filename
         original_name = os.path.splitext(os.path.basename(img_path))[0]
-        
-        if self.hash_names_var.get():
+
+        if settings["hash_names"]:
             # Use hashed filenames if option is checked
             hash_str = hashlib.md5(img.tobytes()).hexdigest()[:8]
             file_name = f"{hash_str}{suffix}.{output_format.lower()}"
         else:
-            # Keep original filename with size suffix
-            size_info = ""
-            if width or height:
-                if width and height:
-                    size_info = f"_{width}x{height}"
-                elif width:
-                    size_info = f"_{width}w"
-                elif height:
-                    size_info = f"_{height}h"
-                    
-            file_name = f"{original_name}.{output_format.lower()}" # {size_info}{suffix} Add size suffix
-            
-        output_path = os.path.join(self.output_dir, file_name)
-        
+            # Keep original filename
+            file_name = f"{original_name}{suffix}.{output_format.lower()}"
+
+        output_path = self.get_unique_output_path(os.path.join(settings["output_dir"], file_name))
+
         # Save options
+        lossless = settings["comp_mode"] == "lossless"
+        quality = settings["quality"]
         save_kwargs = {}
         if output_format == "JPEG":
-            save_kwargs["quality"] = int(self.quality_slider.get())
-            save_kwargs["progressive"] = self.progressive_var.get()
+            # JPEG has no lossless mode, so use its highest quality instead
+            save_kwargs["quality"] = 100 if lossless else quality
+            if lossless:
+                save_kwargs["subsampling"] = 0
+            save_kwargs["progressive"] = settings["progressive"]
+        elif output_format == "PNG":
+            save_kwargs["optimize"] = True
         elif output_format == "WEBP":
-            save_kwargs["quality"] = int(self.quality_slider.get())
+            save_kwargs["lossless"] = lossless
+            # For lossless WebP, quality is compression effort rather than image quality
+            save_kwargs["quality"] = 90 if lossless else quality
             save_kwargs["method"] = 6  # Higher compression
         elif output_format == "AVIF":
-            save_kwargs["quality"] = int(self.quality_slider.get())
-            
+            # AVIF has no true lossless mode here; use maximum quality without chroma subsampling
+            save_kwargs["quality"] = 100 if lossless else quality
+            if lossless:
+                save_kwargs["subsampling"] = "4:4:4"
+
+        # Pillow drops metadata on save unless it is passed explicitly
+        exif = img.getexif()
+        if exif:
+            exif_bytes = exif.tobytes()
+            # JPEG stores EXIF in a single segment of at most 64 KB
+            if output_format != "JPEG" or len(exif_bytes) <= 65533:
+                save_kwargs["exif"] = exif_bytes
+        if img.info.get("icc_profile"):
+            save_kwargs["icc_profile"] = img.info["icc_profile"]
+
         img.save(output_path, format=output_format, **save_kwargs)
-        
+
         return {
             "path": output_path,
             "size": os.path.getsize(output_path),
-            "original_size": os.path.getsize(img_path),
+            "original_size": original_size,
             "dimensions": img.size
         }
-        
+
     def start_processing(self):
         """Start image optimization process"""
         if not self.images:
             self.update_status_bar("No images to process")
             return
-            
+
+        # A previous batch is still running (or still stopping after a reset)
+        if self.processing_thread and self.processing_thread.is_alive():
+            return
+
+        width_str = self.width_var.get().strip()
+        if width_str and (not width_str.isdigit() or int(width_str) == 0):
+            self.update_status_bar("Invalid width")
+            return
+
+        output_dir = filedialog.askdirectory(title="Select Output Directory")
+        if not output_dir:
+            return
+        self.output_dir = output_dir
+
+        # Snapshot settings on the main thread; the worker must not touch Tk widgets or variables
+        self.settings = {
+            "images": list(self.images),
+            "output_dir": output_dir,
+            "format": self.format_var.get(),
+            "comp_mode": self.comp_mode.get(),
+            "quality": int(self.quality_slider.get()),
+            "width": int(width_str) if width_str else None,
+            "progressive": self.progressive_var.get(),
+            "lqip": self.lqip_var.get(),
+            "strip_meta": self.strip_meta_var.get(),
+            "hash_names": self.hash_names_var.get(),
+        }
+        self.source_paths = {os.path.normcase(os.path.abspath(p)) for p in self.images}
+        self.batch_outputs = set()
+
         # Reset processing state
         self.processing = True
         self.optimized_images = []
-        
-        self.output_dir = filedialog.askdirectory(title="Select Output Directory")
-        if not self.output_dir:
-            self.processing = False
-            return
-            
+        self.process_btn.configure(state="disabled")
+
         # Update status to processing
         self.update_status_bar("Processing", 0, len(self.images))
-        
+
         # Start processing in a separate thread
         self.processing_thread = threading.Thread(target=self.process_images)
         self.processing_thread.daemon = True
         self.processing_thread.start()
-        
+        self.after(100, self.poll_ui_queue)
+
+    def post_status(self, *args):
+        """Queue a status bar update from the worker thread"""
+        self.ui_queue.put(args)
+
+    def poll_ui_queue(self):
+        """Apply queued status updates on the main thread (Tk is not thread-safe)"""
+        running = self.processing_thread is not None and self.processing_thread.is_alive()
+        while True:
+            try:
+                args = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            # Drop updates from a batch that was reset
+            if self.processing:
+                self.update_status_bar(*args)
+
+        if running:
+            self.after(100, self.poll_ui_queue)
+        else:
+            self.processing = False
+            self.process_btn.configure(state="normal")
+
     def process_images(self):
-        """Process all images in batch mode"""
-        total = len(self.images)
+        """Process all images in batch mode (runs on a worker thread)"""
+        images = self.settings["images"]
+        total = len(images)
         report_data = []
-        
-        for i, img_path in enumerate(self.images):
+
+        for i, img_path in enumerate(images):
             if not self.processing:  # Allow cancellation
                 break
-                
+
             try:
                 # Update progress
-                self.update_status_bar("Processing", i+1, total)
-                
+                self.post_status("Processing", i+1, total)
+
                 # Process image
                 optimized = self.process_image(img_path)
                 self.optimized_images.append(optimized)
-                
+
                 # Collect report data
                 for version in optimized:
                     original_size = version["original_size"]
                     new_size = version["size"]
                     savings = original_size - new_size
-                    ratio = (savings / original_size) * 100
-                    
+                    ratio = (savings / original_size) * 100 if original_size else 0
+
                     report_data.append({
                         "file": os.path.basename(version["path"]),
                         "original_size": self.format_size(original_size),
@@ -859,15 +911,18 @@ class ImageOptimizerApp(ctk.CTk):
                         "ratio": f"{ratio:.1f}%",
                         "dimensions": version["dimensions"]
                     })
-                    
+
             except Exception as e:
-                self.update_status_bar(f"Error processing {os.path.basename(img_path)}")
+                self.post_status(f"Error processing {os.path.basename(img_path)}")
                 logging.error(f"Error processing {img_path}: {str(e)}")
-                
+
         # Generate report if processing completed
         if self.processing:
-            self.generate_report(report_data)
-            self.update_status_bar("Done", total, total)
+            try:
+                self.generate_report(report_data)
+            except Exception as e:
+                logging.error(f"Error writing report: {str(e)}")
+            self.post_status("Done", total, total)
         
     # ========== COMMON METHODS ==========
     def setup_main_area(self):
@@ -904,7 +959,12 @@ class ImageOptimizerApp(ctk.CTk):
             fg_color="transparent"
         )
         self.preview_label.pack(fill="both", expand=True, padx=10, pady=10)
-        
+
+        # CTkLabel can't fully remove an image (image=None leaves Tk pointing at a deleted
+        # image), so keep the shown image alive and clear the preview with a blank image instead
+        self.preview_image = None
+        self.blank_preview = ctk.CTkImage(light_image=Image.new("RGBA", (1, 1), (0, 0, 0, 0)), size=(1, 1))
+
         # File list section
         self.file_frame = ctk.CTkFrame(
             self.main_frame, 
@@ -1116,30 +1176,26 @@ class ImageOptimizerApp(ctk.CTk):
             # Only extract image-specific metadata for image files
             if self.is_image_file(file_path):
                 file_type = "Image"
-                img = Image.open(file_path)
-                exif_data = img.getexif() if hasattr(img, 'getexif') else {}
-                
-                # Get dimensions for images
-                dimensions = f"{img.width}×{img.height}"
-                
-                # Get resolution for images
-                dpi = img.info.get('dpi', (0, 0))
-                resolution = f"{dpi[0]}×{dpi[1]} DPI" if dpi[0] > 0 else "N/A"
-                
-                # Extract EXIF data for images
-                if exif_data:
-                    # Helper function to get EXIF tag
-                    def get_exif_tag(tag_id):
-                        return exif_data.get(tag_id, "")
-                    
-                    # Get author
-                    author = get_exif_tag(315) or ""
-                    
-                    # Get date taken
-                    date_taken = get_exif_tag(36867) or ""
-                    
-                    # Get camera model
-                    camera_model = get_exif_tag(272) or ""
+                with Image.open(file_path) as img:
+                    exif_data = img.getexif()
+
+                    # Get dimensions for images
+                    dimensions = f"{img.width}×{img.height}"
+
+                    # Get resolution for images
+                    dpi = img.info.get('dpi', (0, 0))
+                    resolution = f"{dpi[0]}×{dpi[1]} DPI" if dpi[0] > 0 else "N/A"
+
+                    # Extract EXIF data for images (TIFF reads sub-IFDs from the open file)
+                    if exif_data:
+                        # Get author
+                        author = exif_data.get(315) or "N/A"
+
+                        # Get date taken (DateTimeOriginal lives in the Exif sub-IFD, not IFD0)
+                        date_taken = exif_data.get_ifd(0x8769).get(36867) or "N/A"
+
+                        # Get camera model
+                        camera_model = exif_data.get(272) or "N/A"
             
             return {
                 "filename": os.path.basename(file_path),
@@ -1237,15 +1293,16 @@ class ImageOptimizerApp(ctk.CTk):
             
         try:
             # Open and apply orientation correction
-            img = Image.open(img_path)
-            img = ImageOps.exif_transpose(img)  # Fix orientation
-            
-            # Resize for preview
-            img.thumbnail((600, 600))
+            with Image.open(img_path) as img:
+                img = ImageOps.exif_transpose(img)  # Fix orientation
+
+                # Resize for preview
+                img.thumbnail((600, 600))
             
             # Create CTkImage and display
             img_tk = ctk.CTkImage(light_image=img, size=img.size)
             self.preview_label.configure(image=img_tk, text="")
+            self.preview_image = img_tk
             
         except Exception as e:
             self.update_status_bar(f"Error: {str(e)}")
@@ -1254,22 +1311,26 @@ class ImageOptimizerApp(ctk.CTk):
         """Convert bytes to human-readable format"""
         if size == 0:
             return "0B"
-        size_name = ("B", "KB", "MB", "GB")
-        i = int(math.floor(math.log(size, 1024)))
+        # Savings are negative when the output is larger than the original
+        sign = "-" if size < 0 else ""
+        size = abs(size)
+        size_name = ("B", "KB", "MB", "GB", "TB")
+        i = min(int(math.floor(math.log(size, 1024))), len(size_name) - 1)
         p = math.pow(1024, i)
         s = round(size / p, 2)
-        return f"{s} {size_name[i]}"
-        
+        return f"{sign}{s} {size_name[i]}"
+
     def generate_report(self, data):
         """Generate optimization reports in JSON and HTML formats"""
-        report_path = os.path.join(self.output_dir, "optimization_report.json")
-        with open(report_path, "w") as f:
+        output_dir = self.settings["output_dir"]
+        report_path = os.path.join(output_dir, "optimization_report.json")
+        with open(report_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-            
+
         # Generate HTML report
-        html_path = os.path.join(self.output_dir, "report.html")
-        with open(html_path, "w") as f:
-            f.write("<html><head><style>")
+        html_path = os.path.join(output_dir, "report.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write('<html><head><meta charset="utf-8"><style>')
             f.write("body { font-family: Arial, sans-serif; }")
             f.write("table { border-collapse: collapse; width: 100%; }")
             f.write("th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }")
@@ -1284,7 +1345,7 @@ class ImageOptimizerApp(ctk.CTk):
             
             for item in data:
                 f.write("<tr>")
-                f.write(f"<td>{item['file']}</td>")
+                f.write(f"<td>{html.escape(item['file'])}</td>")
                 f.write(f"<td>{item['original_size']}</td>")
                 f.write(f"<td>{item['new_size']}</td>")
                 f.write(f"<td>{item['savings']}</td>")
@@ -1307,7 +1368,8 @@ class ImageOptimizerApp(ctk.CTk):
         # Reset UI elements - clear Treeview explicitly
         for item in self.tree.get_children():
             self.tree.delete(item)
-        self.preview_label.configure(image=None, text="")
+        self.preview_label.configure(image=self.blank_preview, text="")
+        self.preview_image = None
         self.update_status_bar("Ready")
         
         # Hide the preview and file list sections
@@ -1319,6 +1381,7 @@ class ImageOptimizerApp(ctk.CTk):
         self.comp_mode.set("lossless")  # Set back to lossless
         self.quality_slider.set(100)
         self.quality_label.configure(text="Quality: 100%")
+        self.on_comp_mode_change()
         self.size_presets.set("Full HD (1920px)")
         self.width_var.set("1920")
         self.height_var.set("")
@@ -1329,7 +1392,7 @@ class ImageOptimizerApp(ctk.CTk):
         self.hash_names_var.set(False)  # Default to unchecked
         
         # Reset renaming controls
-        self.rename_format_var.set("sequential")
+        self.rename_format_var.set("Sequential Numbering")
         self.prefix_var.set("")
         self.suffix_var.set("")
         self.include_date_var.set(True)

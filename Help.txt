@@ -1,4 +1,7 @@
-pip install customtkinter pillow imageio
+Quick start: double-click start.bat
+(it installs the required packages on first run, then opens the app)
+
+Manual install: pip install -r requirements.txt
 
 
 Steps to Run as .pyw:
