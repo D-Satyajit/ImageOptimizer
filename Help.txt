@@ -1,0 +1,31 @@
+pip install customtkinter pillow imageio
+
+
+Steps to Run as .pyw:
+Save the File:
+
+Rename your Python script from .py to .pyw (e.g., image_optimizer.pyw)
+
+Run the Application:
+
+Double-click the .pyw file in Windows Explorer
+
+OR run via command prompt: pythonw image_optimizer.pyw
+
+
+
+
+How to Create a Desktop Shortcut:
+Right-click desktop → New → Shortcut
+
+Enter target: pythonw.exe "C:\path\to\image_optimizer.pyw"
+
+Name it "Image Optimizer"
+
+Right-click shortcut → Properties → Change Icon
+(You can download a PNG icon and convert to .ico)
+
+Troubleshooting .pyw:
+Check Logs: Look for image_optimizer.log in the same directory
+
+Test First: Run as .py to see console errors if the app doesn't start

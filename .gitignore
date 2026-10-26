@@ -1,0 +1,16 @@
+# Optimizer output
+Optimized/
+
+# Runtime log
+*.log
+
+# Sample photos used for local testing
+/*.jpg
+/*.JPG
+/*.jpeg
+/*.JPEG
+
+# Python
+__pycache__/
+*.pyc
+.venv/
