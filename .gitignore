@@ -1,10 +1,12 @@
 # Optimizer output
 Optimized/
 
-# Runtime log
+# Runtime files
 *.log
+image_optimizer.ini
 
-# Sample photos used for local testing
+# Photos for local testing (samples/ is used by the real-photo tests)
+samples/
 /*.jpg
 /*.JPG
 /*.jpeg
@@ -14,6 +16,4 @@ Optimized/
 __pycache__/
 *.pyc
 .venv/
-
-# Remembered folders
-image_optimizer.ini
+.pytest_cache/
